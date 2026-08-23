@@ -989,10 +989,22 @@ class PanelCreateDetailsModal(SafeModal):
         if interaction.guild is None:
             await respond_ephemeral(interaction, "This control can only be used in a server.")
             return
-        panel_channel = self.setup.panel_channel.values[0]
-        open_category = self.setup.open_category.values[0]
-        archive_category = self.setup.archive_category.values[0] if self.setup.archive_category.values else None
-        staff_role = self.setup.staff_role.values[0]
+        panel_channel_id = int(getattr(self.setup.panel_channel.values[0], "id", 0))
+        open_category_id = int(getattr(self.setup.open_category.values[0], "id", 0))
+        archive_category_id = (
+            int(getattr(self.setup.archive_category.values[0], "id", 0))
+            if self.setup.archive_category.values
+            else None
+        )
+        staff_role_id = int(getattr(self.setup.staff_role.values[0], "id", 0))
+        panel_channel = interaction.guild.get_channel(panel_channel_id)
+        open_category = interaction.guild.get_channel(open_category_id)
+        archive_category = (
+            interaction.guild.get_channel(archive_category_id)
+            if archive_category_id
+            else None
+        )
+        staff_role = interaction.guild.get_role(staff_role_id)
         if not isinstance(panel_channel, discord.TextChannel):
             await respond_ephemeral(interaction, "The panel channel must be a text channel.")
             return
@@ -1009,9 +1021,9 @@ class PanelCreateDetailsModal(SafeModal):
         record = await self.setup.cog.repository.create_panel(
             guild_id=interaction.guild.id,
             actor_id=interaction.user.id,
-            panel_channel_id=panel_channel.id,
-            open_category_id=open_category.id,
-            archive_category_id=archive_category.id if archive_category else None,
+            panel_channel_id=panel_channel_id,
+            open_category_id=open_category_id,
+            archive_category_id=archive_category_id,
             title=self.title_input.value.strip()[:256] or "Support tickets",
             description=self.description_input.value.strip()[:4096],
             opening_message=self.opening_input.value[:1000],
@@ -1021,7 +1033,7 @@ class PanelCreateDetailsModal(SafeModal):
             select_placeholder="Choose a support category",
             thumbnail_url=None,
             image_url=None,
-            staff_role_ids=[staff_role.id],
+            staff_role_ids=[staff_role_id],
             notify_staff_on_create=True,
             name_template="{number}-{category}-{username}",
             max_open_per_user=1,
