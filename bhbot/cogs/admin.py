@@ -309,12 +309,16 @@ class PanelEmojiSelect(discord.ui.Select[Any]):
             )
         else:
             editor_refreshed = False
+        if not editor_refreshed:
+            editor_refreshed = await self.picker.editor.send_fresh_editor(
+                interaction, updated
+            )
         target_label = "Panel" if self.picker.target == "panel" else "Category"
         await interaction.followup.send(
             (
                 f"{target_label} emoji updated and the editor refreshed."
                 if editor_refreshed
-                else f"{target_label} emoji updated. Reopen /ticket panels because the old editor expired."
+                else f"{target_label} emoji updated, but Discord did not allow the editor to refresh."
             ),
             ephemeral=True,
         )
@@ -328,7 +332,7 @@ class PanelEmojiPickerView(SafeView):
         target: str,
         current_emoji: str | None,
     ) -> None:
-        super().__init__(timeout=600)
+        super().__init__(timeout=3600)
         self.editor = editor
         self.emojis = emojis
         self.target = target
@@ -338,7 +342,7 @@ class PanelEmojiPickerView(SafeView):
 
 class PanelEditorView(SafeView):
     def __init__(self, cog: "TicketAdminCog", record: TicketPanelRecord, actor_id: int) -> None:
-        super().__init__(timeout=900)
+        super().__init__(timeout=3600)
         self.cog = cog
         self.record = record
         self.panel_id = record.panel.id
@@ -567,7 +571,9 @@ class PanelEditorView(SafeView):
             if message is not None:
                 await interaction.response.defer(ephemeral=True)
                 if changed:
-                    await self.refresh_message(message)
+                    refreshed = await self.refresh_message(message)
+                    if not refreshed:
+                        refreshed = await self.send_fresh_editor(interaction, self.record)
                 await interaction.followup.send(
                     "Panel synchronization queued." if changed else "The panel is currently busy or no longer exists.",
                     ephemeral=True,
@@ -632,11 +638,11 @@ class PanelEditorView(SafeView):
                 return
             manager = PanelSubcategoryManagerView(self, message, selected)
             await interaction.response.send_message(
-                f"Manage the questions and emoji responses inside **{selected.label}** tickets.",
                 embed=manager.manager_embed(),
                 view=manager,
                 ephemeral=True,
             )
+            manager.message = await interaction.original_response()
         elif action == "add-category":
             await interaction.response.send_message(
                 "Choose the Discord category where this ticket type will be created and the roles to ping.",
@@ -675,8 +681,14 @@ class PanelEditorView(SafeView):
                 await respond_ephemeral(interaction, "The panel changed while you were editing it. Reopen the editor.")
                 return
             await interaction.response.defer(ephemeral=True)
-            await self.refresh_message(message)
-            await interaction.followup.send("Category removed and the full editor preview was refreshed.", ephemeral=True)
+            refreshed = await self.refresh_message(message)
+            if not refreshed:
+                refreshed = await self.send_fresh_editor(interaction, updated)
+            await interaction.followup.send(
+                "Category removed and the editor was refreshed." if refreshed
+                else "Category removed, but Discord did not allow the editor to refresh.",
+                ephemeral=True,
+            )
 
 
 class PanelEditorModal(SafeModal):
@@ -973,7 +985,7 @@ class PanelCategoryRoutingView(SafeView):
         message: discord.Message,
         existing: TicketPanelCategory | None = None,
     ) -> None:
-        super().__init__(timeout=600)
+        super().__init__(timeout=3600)
         self.editor = editor
         self.message = message
         self.existing = existing
@@ -1085,7 +1097,11 @@ class PanelSubcategorySelect(discord.ui.Select[Any]):
 
     async def callback(self, interaction: discord.Interaction) -> None:
         self.manager.selected_key = self.values[0]
-        await interaction.response.edit_message(embed=self.manager.manager_embed(), view=self.manager)
+        await interaction.response.edit_message(
+            content=None,
+            embed=self.manager.manager_embed(),
+            view=self.manager,
+        )
 
 
 class PanelSubcategoryManagerButton(discord.ui.Button[Any]):
@@ -1127,7 +1143,12 @@ class PanelSubcategoryManagerButton(discord.ui.Button[Any]):
                 self.manager.category,
                 path=self.manager.path[:-1],
             )
-            await interaction.response.edit_message(embed=parent.manager_embed(), view=parent)
+            parent.message = interaction.message
+            await interaction.response.edit_message(
+                content=None,
+                embed=parent.manager_embed(),
+                view=parent,
+            )
             return
 
         _, options = _model_node(self.manager.category, self.manager.path)
@@ -1149,7 +1170,7 @@ class PanelSubcategoryManagerButton(discord.ui.Button[Any]):
         await interaction.response.defer(ephemeral=True, thinking=True)
         current = await self.manager.editor.current_record()
         current_category = (
-            next((item for item in current.categories if item.id == self.manager.category.id), None)
+            next((item for item in current.categories if item.key == self.manager.category.key), None)
             if current is not None else None
         )
         if current is None or current_category is None:
@@ -1179,45 +1200,23 @@ class PanelSubcategoryManagerButton(discord.ui.Button[Any]):
         if updated is None:
             await interaction.followup.send("The panel changed while you were editing it. Reopen the panel editor.", ephemeral=True)
             return
-        refreshed = await self.manager.editor.refresh_message(self.manager.editor_message)
         if self.action == "next":
-            # Panel updates intentionally replace category rows, so their
-            # database UUIDs change. The stable category key is the correct
-            # identity for reopening the nested editor.
-            updated_category = next(
-                (item for item in updated.categories if item.key == current_category.key),
-                None,
-            )
-            if updated_category is None:
-                await interaction.followup.send(
-                    "The category changed while you were editing it. Reopen the panel editor.",
-                    ephemeral=True,
-                )
-                return
-            child = PanelSubcategoryManagerView(
-                self.manager.editor,
-                self.manager.editor_message,
-                updated_category,
-                path=self.manager.path + (str(self.manager.selected_key),),
-            )
+            path = self.manager.path + (str(self.manager.selected_key),)
+            selected_key = None
+        else:
+            path = self.manager.path
+            selected_key = None
+        replacement = await self.manager.refresh_after_save(
+            interaction,
+            updated,
+            path=path,
+            selected_key=selected_key,
+        )
+        if replacement is None:
             await interaction.followup.send(
-                content="Edit this question and its emoji responses. Each response can open another layer.",
-                embed=child.manager_embed(),
-                view=child,
+                "The change was saved, but Discord could not refresh this editor. Run /ticket panels once to continue.",
                 ephemeral=True,
             )
-        await interaction.followup.send(
-            (
-                "Option removed and the full editor preview was refreshed."
-                if self.action == "remove" and refreshed
-                else "Next question opened. The full editor preview was refreshed."
-                if self.action == "next" and refreshed
-                else "Option removed, but reopen the panel editor to continue."
-                if self.action == "remove"
-                else "Next question saved, but reopen the panel editor to continue."
-            ),
-            ephemeral=True,
-        )
 
 
 class PanelSubcategoryManagerView(SafeView):
@@ -1229,12 +1228,13 @@ class PanelSubcategoryManagerView(SafeView):
         *,
         path: tuple[str, ...] = (),
     ) -> None:
-        super().__init__(timeout=600)
+        super().__init__(timeout=3600)
         self.editor = editor
         self.editor_message = editor_message
         self.category = category
         self.path = path
         self.selected_key: str | None = None
+        self.message: discord.Message | None = None
         _, options = _model_node(category, path)
         if options:
             self.add_item(PanelSubcategorySelect(self))
@@ -1279,6 +1279,97 @@ class PanelSubcategoryManagerView(SafeView):
         embed.set_footer(text="Select an option, then use Next layer to add another question.")
         return embed
 
+    async def refresh_after_save(
+        self,
+        interaction: discord.Interaction,
+        updated: TicketPanelRecord,
+        *,
+        path: tuple[str, ...] | None = None,
+        selected_key: str | None = None,
+    ) -> "PanelSubcategoryManagerView | None":
+        """Keep this question editor open after saving a tree change."""
+        updated_category = next(
+            (item for item in updated.categories if item.key == self.category.key),
+            None,
+        )
+        if updated_category is None:
+            return None
+        target_path = self.path if path is None else path
+        editor_refreshed = await self.editor.refresh_message(self.editor_message)
+        if not editor_refreshed:
+            await self.editor.send_fresh_editor(interaction, updated)
+        replacement = PanelSubcategoryManagerView(
+            self.editor,
+            self.editor.message or self.editor_message,
+            updated_category,
+            path=target_path,
+        )
+        replacement.selected_key = selected_key
+        if self.message is not None:
+            try:
+                await self.message.edit(
+                    content=None,
+                    embed=replacement.manager_embed(),
+                    view=replacement,
+                )
+                replacement.message = self.message
+                return replacement
+            except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                logger.debug("The question editor message is no longer available", exc_info=True)
+        try:
+            replacement.message = await interaction.followup.send(
+                embed=replacement.manager_embed(),
+                view=replacement,
+                ephemeral=True,
+                wait=True,
+            )
+        except discord.HTTPException:
+            logger.debug("Could not reopen the question editor after saving", exc_info=True)
+            return None
+        return replacement
+
+    async def apply_tree_changes(
+        self,
+        interaction: discord.Interaction,
+        categories: list[TicketCategoryConfig],
+        *,
+        selected_key: str | None = None,
+    ) -> None:
+        try:
+            updated = await self.editor.persist({}, categories)
+        except ValueError as error:
+            await respond_ephemeral(interaction, str(error))
+            return
+        if updated is None:
+            await respond_ephemeral(
+                interaction,
+                "The panel changed while you were editing it. The editor will refresh automatically; try again.",
+            )
+            return
+        try:
+            await interaction.response.defer(ephemeral=True)
+            replacement = await self.refresh_after_save(
+                interaction,
+                updated,
+                selected_key=selected_key,
+            )
+            if replacement is None:
+                await interaction.followup.send(
+                    "Saved, but Discord could not refresh this question editor.",
+                    ephemeral=True,
+                )
+        except discord.HTTPException:
+            if interaction.response.is_done():
+                await interaction.followup.send(
+                    "Saved, but Discord could not refresh this question editor.",
+                    ephemeral=True,
+                )
+            else:
+                await respond_ephemeral(
+                    interaction,
+                    "Saved, but Discord could not refresh this question editor.",
+                )
+
 
 class PanelSubcategoryPromptModal(PanelEditorModal):
     def __init__(self, manager: PanelSubcategoryManagerView) -> None:
@@ -1296,7 +1387,7 @@ class PanelSubcategoryPromptModal(PanelEditorModal):
     async def on_submit(self, interaction: discord.Interaction) -> None:
         current = await self.editor.current_record()
         current_category = (
-            next((item for item in current.categories if item.id == self.manager.category.id), None)
+            next((item for item in current.categories if item.key == self.manager.category.key), None)
             if current is not None else None
         )
         if current is None or current_category is None:
@@ -1312,7 +1403,7 @@ class PanelSubcategoryPromptModal(PanelEditorModal):
             node["prompt"] = self.prompt_input.value.strip() or "Choose an option."
         else:
             categories[category_index]["subcategory_prompt"] = self.prompt_input.value.strip()
-        await self.apply_changes(interaction, {}, categories)
+        await self.manager.apply_tree_changes(interaction, categories)
 
 
 class PanelSubcategoryModal(PanelEditorModal):
@@ -1366,7 +1457,7 @@ class PanelSubcategoryModal(PanelEditorModal):
             return
         current = await self.editor.current_record()
         current_category = (
-            next((item for item in current.categories if item.id == self.manager.category.id), None)
+            next((item for item in current.categories if item.key == self.manager.category.key), None)
             if current is not None else None
         )
         if current is None or current_category is None:
@@ -1416,7 +1507,11 @@ class PanelSubcategoryModal(PanelEditorModal):
                 await respond_ephemeral(interaction, "That option is no longer available. Reopen the editor.")
                 return
             options[index] = replacement
-        await self.apply_changes(interaction, {}, categories)
+        await self.manager.apply_tree_changes(
+            interaction,
+            categories,
+            selected_key=replacement["key"],
+        )
 
 
 class PanelCategoryModal(PanelEditorModal):
@@ -1594,7 +1689,7 @@ class PanelCreateRoleSelect(discord.ui.RoleSelect[Any]):
 
 class PanelCreateSetupView(SafeView):
     def __init__(self, cog: "TicketAdminCog") -> None:
-        super().__init__(timeout=600)
+        super().__init__(timeout=3600)
         self.cog = cog
         self.panel_channel = PanelCreateChannelSelect(
             channel_types=[discord.ChannelType.text],
@@ -1738,7 +1833,7 @@ class PanelCreateDetailsModal(SafeModal):
 
 class PanelManagerView(SafeView):
     def __init__(self, cog: "TicketAdminCog", records: list[TicketPanelRecord], actor_id: int) -> None:
-        super().__init__(timeout=900)
+        super().__init__(timeout=3600)
         self.cog = cog
         self.records = records
         self.actor_id = actor_id
