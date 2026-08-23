@@ -1177,11 +1177,30 @@ class TicketsCog(commands.Cog):
                 manage_threads=False,
                 send_messages_in_threads=False,
             )
-        await channel.set_permissions(
-            requester,
-            overwrite=overwrite,
-            reason="Keep ticket staff controls private from requester",
-        )
+        try:
+            await channel.set_permissions(
+                requester,
+                overwrite=overwrite,
+                reason="Keep ticket staff controls private from requester",
+            )
+        except discord.Forbidden:
+            # Discord can reject member overwrites when the bot lacks Manage
+            # Roles or the requester is above the bot's highest role. This is
+            # maintenance, not ticket creation; keep the ticket usable and
+            # let the administrator fix the server permissions separately.
+            logger.warning(
+                "Could not synchronize requester thread permissions for ticket %s; "
+                "check Manage Roles and the bot role hierarchy",
+                record.ticket.id,
+            )
+            return
+        except discord.HTTPException:
+            logger.warning(
+                "Could not synchronize requester thread permissions for ticket %s",
+                record.ticket.id,
+                exc_info=True,
+            )
+            return
         self.visible_member_cache.pop(channel.id, None)
 
     async def ticket_controls_view(
@@ -1641,11 +1660,26 @@ class TicketsCog(commands.Cog):
         for role_id in staff_role_ids:
             role = channel.guild.get_role(int(role_id))
             if role is not None and channel.overwrites_for(role) != desired_staff_overwrite:
-                await channel.set_permissions(
-                    role,
-                    overwrite=desired_staff_overwrite,
-                    reason="Synchronize ticket manager role access",
-                )
+                try:
+                    await channel.set_permissions(
+                        role,
+                        overwrite=desired_staff_overwrite,
+                        reason="Synchronize ticket manager role access",
+                    )
+                except discord.Forbidden:
+                    logger.warning(
+                        "Could not synchronize ticket role %s on ticket %s; "
+                        "check Manage Roles and the bot role hierarchy",
+                        role.id,
+                        ticket.id,
+                    )
+                except discord.HTTPException:
+                    logger.warning(
+                        "Could not synchronize ticket role %s on ticket %s",
+                        role.id,
+                        ticket.id,
+                        exc_info=True,
+                    )
         existing_channel: discord.TextChannel | discord.Thread | None = None
         legacy_channels: list[discord.TextChannel | discord.Thread] = []
         staff_thread: discord.Thread | None = None
@@ -2368,7 +2402,14 @@ class TicketsCog(commands.Cog):
                     if requester:
                         overwrite = channel.overwrites_for(requester)
                         overwrite.update(send_messages=False)
-                        await channel.set_permissions(requester, overwrite=overwrite)
+                        try:
+                            await channel.set_permissions(requester, overwrite=overwrite)
+                        except discord.Forbidden:
+                            logger.warning(
+                                "Could not lock requester permissions for closed ticket %s; "
+                                "check Manage Roles and the bot role hierarchy",
+                                ticket_id,
+                            )
                     await channel.send(
                         f"Ticket closed: {reason}",
                         allowed_mentions=discord.AllowedMentions.none(),
@@ -2463,7 +2504,14 @@ class TicketsCog(commands.Cog):
             if requester:
                 overwrite = ticket_channel.overwrites_for(requester)
                 overwrite.update(view_channel=True, send_messages=True)
-                await ticket_channel.set_permissions(requester, overwrite=overwrite)
+                try:
+                    await ticket_channel.set_permissions(requester, overwrite=overwrite)
+                except discord.Forbidden:
+                    logger.warning(
+                        "Could not restore requester permissions for reopened ticket %s; "
+                        "check Manage Roles and the bot role hierarchy",
+                        record.ticket.id,
+                    )
             await self.move_ticket_to_target_category(record, record.category)
         await self.refresh_ticket_state(record.ticket.id)
         return "Ticket reopened."
@@ -2496,7 +2544,14 @@ class TicketsCog(commands.Cog):
             if requester:
                 overwrite = ticket_channel.overwrites_for(requester)
                 overwrite.update(view_channel=False)
-                await ticket_channel.set_permissions(requester, overwrite=overwrite)
+                try:
+                    await ticket_channel.set_permissions(requester, overwrite=overwrite)
+                except discord.Forbidden:
+                    logger.warning(
+                        "Could not hide requester permissions for archived ticket %s; "
+                        "check Manage Roles and the bot role hierarchy",
+                        record.ticket.id,
+                    )
             await ticket_channel.edit(category=archive, reason="Ticket archived")
         return "Ticket archived."
 

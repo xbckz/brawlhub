@@ -1181,7 +1181,19 @@ class PanelSubcategoryManagerButton(discord.ui.Button[Any]):
             return
         refreshed = await self.manager.editor.refresh_message(self.manager.editor_message)
         if self.action == "next":
-            updated_category = next(item for item in updated.categories if item.id == current_category.id)
+            # Panel updates intentionally replace category rows, so their
+            # database UUIDs change. The stable category key is the correct
+            # identity for reopening the nested editor.
+            updated_category = next(
+                (item for item in updated.categories if item.key == current_category.key),
+                None,
+            )
+            if updated_category is None:
+                await interaction.followup.send(
+                    "The category changed while you were editing it. Reopen the panel editor.",
+                    ephemeral=True,
+                )
+                return
             child = PanelSubcategoryManagerView(
                 self.manager.editor,
                 self.manager.editor_message,
