@@ -310,6 +310,20 @@ def ticket_flow_node(category: TicketPanelCategory) -> dict[str, Any]:
     }
 
 
+def ticket_flow_question_content(
+    node: dict[str, Any], guild: discord.Guild | None = None
+) -> str:
+    """Render a question like a reaction menu, while keeping button controls."""
+    lines = [str(node.get("prompt") or "Choose an option.").strip()]
+    for position, option in enumerate(node.get("options", [])[:25]):
+        if not isinstance(option, dict):
+            continue
+        fallback = default_subcategory_emoji(position) or "•"
+        rendered = safe_component_emoji(option.get("emoji") or fallback, guild=guild)
+        lines.append(f"{rendered or fallback} {str(option.get('label') or 'Option')[:100]}")
+    return "\n".join(lines)[:2000]
+
+
 class TicketFlowOptionButton(discord.ui.Button["TicketFlowView"]):
     def __init__(self, view: "TicketFlowView", option: dict[str, Any], position: int) -> None:
         self.option = option
@@ -2089,7 +2103,7 @@ class TicketsCog(commands.Cog):
             {"prompt": node.get("prompt"), "options": options},
         )
         return await channel.send(
-            str(node.get("prompt") or "Choose an option.")[:2000],
+            ticket_flow_question_content(node, channel.guild),
             view=view,
             allowed_mentions=discord.AllowedMentions.none(),
         )
