@@ -1,6 +1,7 @@
 """Selected-admin Discord commands for configuring the ticket subsystem."""
 
 import io
+import logging
 import re
 import uuid
 from typing import Any, cast
@@ -20,6 +21,8 @@ from bhbot.ui import (
     safe_component_emoji,
     themed_embed,
 )
+
+logger = logging.getLogger(__name__)
 
 ticket_commands = app_commands.Group(
     name="ticket", description="Configure and inspect the ticket system."
@@ -252,10 +255,18 @@ class PanelEmojiSelect(discord.ui.Select[Any]):
             )
             return
         if self.picker.editor.message is not None:
-            await self.picker.editor.refresh_message(self.picker.editor.message)
+            editor_refreshed = await self.picker.editor.refresh_message(
+                self.picker.editor.message
+            )
+        else:
+            editor_refreshed = False
         target_label = "Panel" if self.picker.target == "panel" else "Category"
         await interaction.followup.send(
-            f"{target_label} emoji updated and the editor refreshed.",
+            (
+                f"{target_label} emoji updated and the editor refreshed."
+                if editor_refreshed
+                else f"{target_label} emoji updated. Reopen /ticket panels because the old editor expired."
+            ),
             ephemeral=True,
         )
 
@@ -387,10 +398,10 @@ class PanelEditorView(SafeView):
         categories[category_index]["emoji"] = emoji
         return await self.persist({}, categories)
 
-    async def refresh_message(self, message: discord.Message) -> None:
+    async def refresh_message(self, message: discord.Message) -> bool:
         record = await self.current_record()
         if record is None:
-            return
+            return False
         selected_key = next(
             (item.key for item in self.record.categories if item.id == self.selected_category_id),
             None,
@@ -412,7 +423,7 @@ class PanelEditorView(SafeView):
         except (discord.NotFound, discord.Forbidden):
             logger.debug("The panel editor message is no longer available", exc_info=True)
             self.message = None
-            return
+            return False
         if refreshed.preview_message is not None:
             ticket_cog = self.cog.bot.get_cog("TicketsCog")
             if ticket_cog is not None:
@@ -426,6 +437,7 @@ class PanelEditorView(SafeView):
                     )
                 except (discord.NotFound, discord.Forbidden, discord.HTTPException):
                     refreshed.preview_message = None
+        return True
 
     async def send_preview(self, interaction: discord.Interaction) -> None:
         ticket_cog = self.cog.bot.get_cog("TicketsCog")
@@ -578,8 +590,15 @@ class PanelEditorModal(SafeModal):
             return
         try:
             await interaction.response.defer(ephemeral=True)
-            await self.editor.refresh_message(self.message)
-            await interaction.followup.send("Panel changes saved and the full editor preview was refreshed.", ephemeral=True)
+            refreshed = await self.editor.refresh_message(self.message)
+            await interaction.followup.send(
+                (
+                    "Panel changes saved and the full editor preview was refreshed."
+                    if refreshed
+                    else "Panel changes saved. The old editor expired; run /ticket panels again to continue editing."
+                ),
+                ephemeral=True,
+            )
         except discord.HTTPException:
             if interaction.response.is_done():
                 await interaction.followup.send(
