@@ -465,7 +465,7 @@ class PanelEditorView(SafeView):
                 embed=refreshed.editor_embed(),
                 view=refreshed,
             )
-        except (discord.NotFound, discord.Forbidden):
+        except (discord.NotFound, discord.Forbidden, discord.HTTPException):
             logger.debug("The panel editor message is no longer available", exc_info=True)
             self.message = None
             return False
@@ -482,6 +482,39 @@ class PanelEditorView(SafeView):
                     )
                 except (discord.NotFound, discord.Forbidden, discord.HTTPException):
                     refreshed.preview_message = None
+        return True
+
+    async def send_fresh_editor(
+        self,
+        interaction: discord.Interaction,
+        record: TicketPanelRecord,
+    ) -> bool:
+        """Open a replacement editor when an ephemeral editor cannot be edited."""
+        selected_key = next(
+            (item.key for item in self.record.categories if item.id == self.selected_category_id),
+            None,
+        )
+        refreshed = PanelEditorView(self.cog, record, self.actor_id)
+        refreshed.selected_category_id = next(
+            (item.id for item in record.categories if item.key == selected_key),
+            None,
+        )
+        refreshed.preview_message = self.preview_message
+        try:
+            message = await interaction.followup.send(
+                content=refreshed.editor_content(),
+                embed=refreshed.editor_embed(),
+                view=refreshed,
+                ephemeral=True,
+                wait=True,
+            )
+        except discord.HTTPException:
+            logger.debug("Could not open a replacement panel editor", exc_info=True)
+            return False
+        refreshed.message = message
+        self.record = record
+        self.message = message
+        self.selected_category_id = refreshed.selected_category_id
         return True
 
     async def send_preview(self, interaction: discord.Interaction) -> None:
@@ -659,11 +692,18 @@ class PanelEditorModal(SafeModal):
         try:
             await interaction.response.defer(ephemeral=True)
             refreshed = await self.editor.refresh_message(self.message)
+            reopened = False
+            if not refreshed:
+                reopened = await self.editor.send_fresh_editor(interaction, updated)
             await interaction.followup.send(
                 (
                     "Panel changes saved and the full editor preview was refreshed."
                     if refreshed
-                    else "Panel changes saved. The old editor expired; run /ticket panels again to continue editing."
+                    else (
+                        "Panel changes saved and a fresh editor was opened for you."
+                        if reopened
+                        else "Panel changes saved, but Discord would not reopen the editor. Run /ticket panels again."
+                    )
                 ),
                 ephemeral=True,
             )
@@ -878,18 +918,30 @@ class PanelCategoryRoutingContinueButton(discord.ui.Button[Any]):
         if interaction.guild is None:
             await respond_ephemeral(interaction, "This control can only be used in a server.")
             return
-        if not self.routing.target_category.values:
+        target_values = list(self.routing.target_category.values)
+        if not target_values:
+            target_values = [
+                discord.Object(id=int(default.id))
+                for default in self.routing.target_category.default_values
+            ]
+        role_values = list(self.routing.ping_roles.values)
+        if not role_values:
+            role_values = [
+                discord.Object(id=int(default.id))
+                for default in self.routing.ping_roles.default_values
+            ]
+        if not target_values:
             await respond_ephemeral(interaction, "Select the Discord target category first.")
             return
-        if not self.routing.ping_roles.values:
+        if not role_values:
             await respond_ephemeral(interaction, "Select at least one role to ping for this ticket category.")
             return
-        target_id = int(getattr(self.routing.target_category.values[0], "id", 0))
+        target_id = int(getattr(target_values[0], "id", 0))
         target = interaction.guild.get_channel(target_id)
         if not isinstance(target, discord.CategoryChannel):
             await respond_ephemeral(interaction, "The selected target must be a category channel in this server.")
             return
-        role_ids = [int(getattr(role, "id", 0)) for role in self.routing.ping_roles.values]
+        role_ids = [int(getattr(role, "id", 0)) for role in role_values]
         if any(interaction.guild.get_role(role_id) is None for role_id in role_ids):
             await respond_ephemeral(interaction, "Every selected ping role must belong to this server.")
             return
@@ -1057,10 +1109,19 @@ class PanelSubcategoryManagerButton(discord.ui.Button[Any]):
             await interaction.followup.send("The panel changed while you were editing it. Reopen the panel editor.", ephemeral=True)
             return
         refreshed = await self.manager.editor.refresh_message(self.manager.editor_message)
+        reopened = False
+        if not refreshed:
+            reopened = await self.manager.editor.send_fresh_editor(interaction, updated)
         await interaction.followup.send(
-            "Subcategory removed and the full editor preview was refreshed."
-            if refreshed
-            else "Subcategory removed. Reopen /ticket panels because the old editor expired.",
+            (
+                "Subcategory removed and the full editor preview was refreshed."
+                if refreshed
+                else (
+                    "Subcategory removed and a fresh editor was opened for you."
+                    if reopened
+                    else "Subcategory removed, but Discord would not reopen the editor. Run /ticket panels again."
+                )
+            ),
             ephemeral=True,
         )
 
