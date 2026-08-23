@@ -29,6 +29,8 @@ class TicketFormFieldConfig(TypedDict):
 
 class TicketCategoryConfig(TypedDict):
     target_category_id: int | None
+    subcategory_prompt: str
+    subcategories: list[dict[str, str | None]]
     key: str
     label: str
     description: str | None
@@ -149,6 +151,17 @@ def _category(row: dict[str, Any]) -> TicketPanelCategory:
         target_category_id=(
             str(row["target_category_id"]) if row.get("target_category_id") else None
         ),
+        subcategory_prompt=str(row.get("subcategory_prompt") or ""),
+        subcategories=[
+            {
+                "key": str(item.get("key") or ""),
+                "label": str(item.get("label") or ""),
+                "description": str(item["description"]) if item.get("description") else None,
+                "emoji": str(item["emoji"]) if item.get("emoji") else None,
+            }
+            for item in _json(row.get("subcategories"), [])
+            if isinstance(item, dict) and item.get("key") and item.get("label")
+        ],
         key=str(row["key"]),
         label=str(row["label"]),
         description=str(row["description"]) if row["description"] is not None else None,
@@ -231,6 +244,7 @@ SELECT t.*,
     p.revision AS panel_revision, p.created_at AS panel_created_at, p.updated_at AS panel_updated_at,
     c.id AS category_record_id, c.panel_id AS category_panel_id,
     c.target_category_id AS category_target_category_id,
+    c.subcategory_prompt AS category_subcategory_prompt, c.subcategories AS category_subcategories,
     c.key AS category_key, c.label AS category_label, c.description AS category_description,
     c.emoji AS category_emoji, c.staff_role_ids AS category_staff_role_ids,
     c.form_fields AS category_form_fields, c.position AS category_position, c.active AS category_active
@@ -339,6 +353,8 @@ class TicketRepository:
                 str(category_id := uuid.uuid4()),
                 str(panel_id),
                 str(category["target_category_id"]) if category["target_category_id"] else None,
+                category["subcategory_prompt"],
+                _json_text(category["subcategories"]),
                 category["key"],
                 category["label"],
                 category["description"],
@@ -407,8 +423,8 @@ class TicketRepository:
             connection.executemany(
                 """
                 INSERT INTO ticket_panel_categories
-                (id, panel_id, target_category_id, key, label, description, emoji, staff_role_ids, form_fields, position, active)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                (id, panel_id, target_category_id, subcategory_prompt, subcategories, key, label, description, emoji, staff_role_ids, form_fields, position, active)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 category_rows,
             )
@@ -481,8 +497,8 @@ class TicketRepository:
             connection.executemany(
                 """
                 INSERT INTO ticket_panel_categories
-                (id, panel_id, target_category_id, key, label, description, emoji, staff_role_ids, form_fields, position, active)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                (id, panel_id, target_category_id, subcategory_prompt, subcategories, key, label, description, emoji, staff_role_ids, form_fields, position, active)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 category_rows,
             )
@@ -1039,6 +1055,8 @@ def _record_from_joined_row(row: dict[str, Any]) -> TicketRecord:
     category_row = {
         "id": row["category_record_id"], "panel_id": row["category_panel_id"],
         "target_category_id": row["category_target_category_id"], "key": row["category_key"],
+        "subcategory_prompt": row["category_subcategory_prompt"],
+        "subcategories": row["category_subcategories"],
         "label": row["category_label"], "description": row["category_description"],
         "emoji": row["category_emoji"], "staff_role_ids": row["category_staff_role_ids"],
         "form_fields": row["category_form_fields"], "position": row["category_position"],

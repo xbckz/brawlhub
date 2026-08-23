@@ -97,6 +97,8 @@ SCHEMA_STATEMENTS: tuple[str, ...] = (
         id TEXT PRIMARY KEY,
         panel_id TEXT NOT NULL,
         target_category_id TEXT,
+        subcategory_prompt TEXT NOT NULL DEFAULT '',
+        subcategories TEXT NOT NULL DEFAULT '[]',
         key TEXT NOT NULL,
         label TEXT NOT NULL,
         description TEXT,
@@ -250,6 +252,14 @@ class Database:
             if "target_category_id" not in category_columns:
                 connection.execute(
                     "ALTER TABLE ticket_panel_categories ADD COLUMN target_category_id TEXT"
+                )
+            if "subcategory_prompt" not in category_columns:
+                connection.execute(
+                    "ALTER TABLE ticket_panel_categories ADD COLUMN subcategory_prompt TEXT NOT NULL DEFAULT ''"
+                )
+            if "subcategories" not in category_columns:
+                connection.execute(
+                    "ALTER TABLE ticket_panel_categories ADD COLUMN subcategories TEXT NOT NULL DEFAULT '[]'"
                 )
             ticket_columns = {
                 str(row[1])

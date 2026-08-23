@@ -48,6 +48,18 @@ ACTIVITY_WRITE_COOLDOWN_SECONDS = 15.0
 STAFF_MEMBER_CACHE_SECONDS = 300.0
 STAFF_THREAD_SYNC_COOLDOWN_SECONDS = 300.0
 VISIBLE_MEMBER_CACHE_SECONDS = 60.0
+DEFAULT_SUBCATEGORY_EMOJIS = (
+    "1️⃣", "2️⃣", "3️⃣", "4️⃣", "5️⃣",
+    "6️⃣", "7️⃣", "8️⃣", "9️⃣", "🔟",
+)
+
+
+def default_subcategory_emoji(position: int) -> str | None:
+    return (
+        DEFAULT_SUBCATEGORY_EMOJIS[position]
+        if position < len(DEFAULT_SUBCATEGORY_EMOJIS)
+        else None
+    )
 
 
 def is_ticket_staff(
@@ -166,7 +178,11 @@ def ticket_channel_overwrites(
 
 class TicketRequestModal(SafeModal):
     def __init__(
-        self, cog: "TicketsCog", panel: TicketPanel, category: TicketPanelCategory
+        self,
+        cog: "TicketsCog",
+        panel: TicketPanel,
+        category: TicketPanelCategory,
+        subcategory: dict[str, str | None] | None = None,
     ) -> None:
         super().__init__(
             title=f"Open: {category.label}"[:45],
@@ -176,6 +192,7 @@ class TicketRequestModal(SafeModal):
         self.cog = cog
         self.panel = panel
         self.category = category
+        self.subcategory = subcategory
         self.inputs: dict[str, discord.ui.TextInput[discord.ui.Modal]] = {}
         for field in category.form_fields:
             item: discord.ui.TextInput[discord.ui.Modal] = discord.ui.TextInput(
@@ -201,7 +218,89 @@ class TicketRequestModal(SafeModal):
             self.panel,
             self.category,
             {key: item.value.strip() for key, item in self.inputs.items()},
+            subcategory=self.subcategory,
         )
+
+
+class TicketSubcategoryButton(discord.ui.Button["TicketSubcategoryView"]):
+    def __init__(
+        self,
+        view: "TicketSubcategoryView",
+        subcategory: dict[str, str | None],
+        position: int,
+    ) -> None:
+        self.subcategory = subcategory
+        emoji = safe_component_emoji(
+            subcategory.get("emoji") or default_subcategory_emoji(position),
+            guild=view.cog.bot.get_guild(int(view.record.panel.guild_id)),
+        )
+        super().__init__(
+            label=str(position + 1) if emoji is None else None,
+            emoji=emoji,
+            style=discord.ButtonStyle.secondary,
+            row=position // 5,
+            custom_id=f"ticket-subcat:{view.category.id.hex[:8]}:{subcategory.get('key', '')}",
+        )
+        self.subcategory_view = view
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        if interaction.guild is None or not isinstance(interaction.user, discord.Member):
+            await respond_ephemeral(interaction, "Tickets require a server.")
+            return
+        current_record = await self.subcategory_view.cog.repository.get_panel(
+            guild_id=interaction.guild.id,
+            panel_id=self.subcategory_view.record.panel.id,
+        )
+        if current_record is None:
+            await respond_ephemeral(interaction, "This ticket panel is no longer available.")
+            return
+        category = next(
+            (item for item in current_record.categories if item.id == self.subcategory_view.category.id),
+            None,
+        )
+        selected = (
+            next(
+                (
+                    item
+                    for item in category.subcategories
+                    if item.get("key") == self.subcategory.get("key")
+                ),
+                None,
+            )
+            if category is not None
+            else None
+        )
+        if category is None or selected is None:
+            await respond_ephemeral(interaction, "That subcategory is no longer available. Open the panel again.")
+            return
+        if category.form_fields:
+            await interaction.response.send_modal(
+                TicketRequestModal(self.subcategory_view.cog, current_record.panel, category, selected)
+            )
+            return
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        await self.subcategory_view.cog.create_ticket(
+            interaction,
+            current_record.panel,
+            category,
+            {},
+            subcategory=selected,
+        )
+
+
+class TicketSubcategoryView(SafeView):
+    def __init__(
+        self,
+        cog: "TicketsCog",
+        record: TicketPanelRecord,
+        category: TicketPanelCategory,
+    ) -> None:
+        super().__init__(timeout=600)
+        self.cog = cog
+        self.record = record
+        self.category = category
+        for position, subcategory in enumerate(category.subcategories[:25]):
+            self.add_item(TicketSubcategoryButton(self, subcategory, position))
 
 
 class TicketPanelSelect(discord.ui.Select["TicketPanelView"]):
@@ -279,6 +378,15 @@ class TicketPanelSelect(discord.ui.Select["TicketPanelView"]):
             return
         if panel.guild_id != str(interaction.guild.id):
             await interaction.response.send_message("This ticket panel is invalid.", ephemeral=True)
+            return
+        if category.subcategories:
+            await interaction.response.send_message(
+                embed=self.cog.ticket_subcategory_embed(current_record, category),
+                view=TicketSubcategoryView(self.cog, current_record, category),
+                ephemeral=True,
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+            await self.reset_panel_selector(interaction, current_record)
             return
         elif category.form_fields:
             await interaction.response.send_modal(TicketRequestModal(self.cog, panel, category))
@@ -1166,6 +1274,8 @@ class TicketsCog(commands.Cog):
                 ),
                 key,
             )
+            if key == "__subcategory":
+                label = "Subcategory"
             embed.add_field(name=label, value=value[:1024] or "Not provided", inline=False)
         if ticket.close_reason and status in {"closed", "archived"}:
             embed.add_field(name="Close reason", value=ticket.close_reason[:1024], inline=False)
@@ -1182,6 +1292,37 @@ class TicketsCog(commands.Cog):
                 inline=False,
             )
         return embed
+
+    def ticket_subcategory_embed(
+        self,
+        record: TicketPanelRecord,
+        category: TicketPanelCategory,
+    ) -> discord.Embed:
+        prompt = category.subcategory_prompt or "Choose a reason for opening this ticket."
+        guild = self.bot.get_guild(int(record.panel.guild_id))
+        lines = []
+        for index, item in enumerate(category.subcategories[:25]):
+            emoji = safe_component_emoji(
+                item.get("emoji") or default_subcategory_emoji(index),
+                guild=guild,
+            )
+            line = f"{emoji or '•'} **{item.get('label', 'Subcategory')}**"
+            if item.get("description"):
+                line += f" — {item['description']}"
+            lines.append(line)
+        description = (
+            f"**{category.label}**\n\n"
+            + "\n".join(lines)
+            + "\n\nChoose an emoji below to continue."
+        )
+        return themed_embed(
+            "ticket",
+            title=prompt,
+            description=description[:4096],
+            color=record.panel.color,
+            emoji=record.panel.emoji,
+            footer_text=record.panel.footer_text,
+        )
 
     async def member_can_view_ticket(
         self, record: TicketRecord, member: discord.Member
@@ -1850,6 +1991,7 @@ class TicketsCog(commands.Cog):
         category: TicketPanelCategory,
         answers: dict[str, str],
         *,
+        subcategory: dict[str, str | None] | None = None,
         subject_override: str | None = None,
         opening_message: str | None = None,
     ) -> None:
@@ -1863,6 +2005,26 @@ class TicketsCog(commands.Cog):
             )
             return
         panel, category = configuration
+        selected_subcategory = None
+        if subcategory is not None:
+            selected_subcategory = next(
+                (
+                    item
+                    for item in category.subcategories
+                    if item.get("key") == subcategory.get("key")
+                ),
+                None,
+            )
+            if selected_subcategory is None:
+                await self.ticket_creation_response(
+                    interaction,
+                    "That ticket subcategory is no longer available. Please start again.",
+                )
+                return
+            answers = {
+                "__subcategory": str(selected_subcategory.get("label") or ""),
+                **answers,
+            }
         subject = (
             subject_override
             or next((value for value in answers.values() if value), category.label)

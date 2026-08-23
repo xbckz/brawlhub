@@ -74,6 +74,8 @@ class TicketPanelCategory:
     id: uuid.UUID
     panel_id: uuid.UUID
     target_category_id: str | None
+    subcategory_prompt: str
+    subcategories: list[dict[str, Any]]
     key: str
     label: str
     description: str | None
