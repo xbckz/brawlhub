@@ -446,6 +446,12 @@ class PanelEditorView(SafeView):
             await self.send_preview(interaction)
             return
         if action == "publish":
+            if not self.record.categories:
+                await respond_ephemeral(
+                    interaction,
+                    "Add at least one category before publishing this panel.",
+                )
+                return
             changed = await self.cog.repository.queue_panel(
                 guild_id=int(self.record.panel.guild_id), panel_id=self.panel_id,
                 actor_id=interaction.user.id,
@@ -880,6 +886,152 @@ class PanelManagerButton(discord.ui.Button[Any]):
         await self.manager.handle_action(self.action, interaction)
 
 
+class PanelCreateContinueButton(discord.ui.Button[Any]):
+    def __init__(self, setup: "PanelCreateSetupView") -> None:
+        super().__init__(
+            label="Continue",
+            style=discord.ButtonStyle.success,
+            row=4,
+            custom_id="ticket-panel-create-continue",
+        )
+        self.setup = setup
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        await self.setup.continue_to_details(interaction)
+
+
+class PanelCreateSetupView(SafeView):
+    def __init__(self, cog: "TicketAdminCog") -> None:
+        super().__init__(timeout=600)
+        self.cog = cog
+        self.panel_channel = discord.ui.ChannelSelect(
+            channel_types=[discord.ChannelType.text],
+            placeholder="Select the panel channel",
+            min_values=1,
+            max_values=1,
+            row=0,
+            custom_id="ticket-panel-create-channel",
+        )
+        self.open_category = discord.ui.ChannelSelect(
+            channel_types=[discord.ChannelType.category],
+            placeholder="Select the ticket category",
+            min_values=1,
+            max_values=1,
+            row=1,
+            custom_id="ticket-panel-create-open-category",
+        )
+        self.archive_category = discord.ui.ChannelSelect(
+            channel_types=[discord.ChannelType.category],
+            placeholder="Select an archive category (optional)",
+            min_values=0,
+            max_values=1,
+            row=2,
+            custom_id="ticket-panel-create-archive-category",
+        )
+        self.staff_role = discord.ui.RoleSelect(
+            placeholder="Select the staff role",
+            min_values=1,
+            max_values=1,
+            row=3,
+            custom_id="ticket-panel-create-staff-role",
+        )
+        self.add_item(self.panel_channel)
+        self.add_item(self.open_category)
+        self.add_item(self.archive_category)
+        self.add_item(self.staff_role)
+        self.add_item(PanelCreateContinueButton(self))
+
+    async def continue_to_details(self, interaction: discord.Interaction) -> None:
+        if not self.panel_channel.values or not self.open_category.values or not self.staff_role.values:
+            await respond_ephemeral(
+                interaction,
+                "Select the panel channel, ticket category, and staff role first.",
+            )
+            return
+        await interaction.response.send_modal(PanelCreateDetailsModal(self))
+
+
+class PanelCreateDetailsModal(SafeModal):
+    def __init__(self, setup: PanelCreateSetupView) -> None:
+        super().__init__(title="Create ticket panel", timeout=600)
+        self.setup = setup
+        self.title_input = discord.ui.TextInput(
+            label="Panel title",
+            default="Support tickets",
+            max_length=100,
+        )
+        self.description_input = discord.ui.TextInput(
+            label="Panel description",
+            style=discord.TextStyle.paragraph,
+            default="Choose a category below to open a private support ticket.",
+            max_length=1000,
+        )
+        self.opening_input = discord.ui.TextInput(
+            label="Ticket opening message",
+            style=discord.TextStyle.paragraph,
+            default="Thanks for opening a ticket. A member of our team will be with you shortly.",
+            max_length=1000,
+        )
+        for item in (self.title_input, self.description_input, self.opening_input):
+            self.add_item(item)
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        if interaction.guild is None:
+            await respond_ephemeral(interaction, "This control can only be used in a server.")
+            return
+        panel_channel = self.setup.panel_channel.values[0]
+        open_category = self.setup.open_category.values[0]
+        archive_category = self.setup.archive_category.values[0] if self.setup.archive_category.values else None
+        staff_role = self.setup.staff_role.values[0]
+        if not isinstance(panel_channel, discord.TextChannel):
+            await respond_ephemeral(interaction, "The panel channel must be a text channel.")
+            return
+        if not isinstance(open_category, discord.CategoryChannel):
+            await respond_ephemeral(interaction, "The ticket category must be a category channel.")
+            return
+        if archive_category is not None and not isinstance(archive_category, discord.CategoryChannel):
+            await respond_ephemeral(interaction, "The archive category must be a category channel.")
+            return
+        if not isinstance(staff_role, discord.Role) or staff_role.is_default():
+            await respond_ephemeral(interaction, "Select a normal staff role, not @everyone.")
+            return
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        record = await self.setup.cog.repository.create_panel(
+            guild_id=interaction.guild.id,
+            actor_id=interaction.user.id,
+            panel_channel_id=panel_channel.id,
+            open_category_id=open_category.id,
+            archive_category_id=archive_category.id if archive_category else None,
+            title=self.title_input.value.strip()[:256] or "Support tickets",
+            description=self.description_input.value.strip()[:4096],
+            opening_message=self.opening_input.value[:1000],
+            color=0x22B8CF,
+            emoji="🎫",
+            footer_text="SUPPORT • Choose a category below",
+            select_placeholder="Choose a support category",
+            thumbnail_url=None,
+            image_url=None,
+            staff_role_ids=[staff_role.id],
+            notify_staff_on_create=True,
+            name_template="{number}-{category}-{username}",
+            max_open_per_user=1,
+            duplicate_scope="category",
+            inactivity_reminder_hours=None,
+            auto_close_hours=None,
+            transcript_retention_days=30,
+            status="draft",
+            categories=[],
+        )
+        editor = PanelEditorView(self.setup.cog, record, interaction.user.id)
+        editor.message = await interaction.followup.send(
+            "Panel created as a draft. Use **Add category** in the editor before publishing.",
+            embed=editor.editor_embed(),
+            view=editor,
+            ephemeral=True,
+            wait=True,
+        )
+
+
 class PanelManagerView(SafeView):
     def __init__(self, cog: "TicketAdminCog", records: list[TicketPanelRecord], actor_id: int) -> None:
         super().__init__(timeout=900)
@@ -888,6 +1040,7 @@ class PanelManagerView(SafeView):
         self.actor_id = actor_id
         self.selected_panel_id: uuid.UUID | None = None
         self.add_item(PanelManagerSelect(self))
+        self.add_item(PanelManagerButton(self, "Add panel", "add", style=discord.ButtonStyle.success))
         self.add_item(PanelManagerButton(self, "Edit", "edit"))
         self.add_item(PanelManagerButton(self, "Preview", "preview"))
         self.add_item(PanelManagerButton(self, "Publish", "publish", style=discord.ButtonStyle.success))
@@ -909,7 +1062,7 @@ class PanelManagerView(SafeView):
                 f"• **{record.panel.title}** — {record.panel.status} — {len(record.categories)} categories"
                 for record in self.records[:25]
             )[:1024]
-            or "No panels exist yet. Use /ticket panel-create.",
+            or "No panels exist yet. Click **Add panel** below.",
             inline=False,
         )
         if selected is not None:
@@ -921,6 +1074,13 @@ class PanelManagerView(SafeView):
         return embed
 
     async def handle_action(self, action: str, interaction: discord.Interaction) -> None:
+        if action == "add":
+            await interaction.response.send_message(
+                "Choose where the panel and tickets should be created, then continue.",
+                view=PanelCreateSetupView(self.cog),
+                ephemeral=True,
+            )
+            return
         if interaction.guild is None or self.selected_panel_id is None:
             await respond_ephemeral(interaction, "Select a panel first.")
             return
@@ -937,6 +1097,12 @@ class PanelManagerView(SafeView):
         elif action == "preview":
             await editor.send_preview(interaction)
         elif action == "publish":
+            if not record.categories:
+                await respond_ephemeral(
+                    interaction,
+                    "Add at least one category before publishing this panel.",
+                )
+                return
             changed = await self.cog.repository.queue_panel(
                 guild_id=interaction.guild.id, panel_id=record.panel.id, actor_id=interaction.user.id
             )
@@ -958,102 +1124,6 @@ class TicketAdminCog(commands.Cog):
     def __init__(self, bot: commands.Bot) -> None:
         self.bot = cast(TicketBot, bot)
         self.repository = TicketRepository(self.bot.database)
-
-    @ticket_commands.command(
-        name="panel-create", description="Create and publish a ticket panel."
-    )
-    @app_commands.guild_only()
-    @app_commands.check(selected_admin)
-    @app_commands.describe(
-        panel_channel="Text channel where the ticket panel will be posted.",
-        open_category="Category where new private ticket channels will be created.",
-        staff_role="Role that can manage tickets.",
-        category="Initial ticket category label.",
-        title="Panel title.",
-        description="Panel description.",
-        opening_message="Message sent in a newly opened ticket.",
-        archive_category="Optional category for archived tickets.",
-    )
-    async def panel_create(
-        self,
-        interaction: discord.Interaction,
-        panel_channel: discord.TextChannel,
-        open_category: discord.CategoryChannel,
-        staff_role: discord.Role,
-        category: str,
-        title: str = "Support tickets",
-        description: str = "Choose a category below to open a private support ticket.",
-        opening_message: str = "Thanks for opening a ticket. A member of our team will be with you shortly.",
-        archive_category: discord.CategoryChannel | None = None,
-    ) -> None:
-        if interaction.guild is None or panel_channel.guild != interaction.guild:
-            await interaction.response.send_message("All resources must be in this server.", ephemeral=True)
-            return
-        if open_category.guild != interaction.guild or staff_role.guild != interaction.guild:
-            await interaction.response.send_message("All resources must be in this server.", ephemeral=True)
-            return
-        if archive_category is not None and archive_category.guild != interaction.guild:
-            await interaction.response.send_message("The archive category must be in this server.", ephemeral=True)
-            return
-        label = category[:100].strip()
-        if not label:
-            await interaction.response.send_message("The initial category cannot be empty.", ephemeral=True)
-            return
-        await interaction.response.defer(ephemeral=True, thinking=True)
-        record = await self.repository.create_panel(
-            guild_id=interaction.guild.id,
-            actor_id=interaction.user.id,
-            panel_channel_id=panel_channel.id,
-            open_category_id=open_category.id,
-            archive_category_id=archive_category.id if archive_category else None,
-            title=title[:256],
-            description=description[:4096],
-            opening_message=opening_message[:1000],
-            color=0x22B8CF,
-            emoji="🎫",
-            footer_text="SUPPORT • Choose a category below",
-            select_placeholder="Choose a support category",
-            thumbnail_url=None,
-            image_url=None,
-            staff_role_ids=[staff_role.id],
-            notify_staff_on_create=True,
-            name_template="{number}-{category}-{username}",
-            max_open_per_user=1,
-            duplicate_scope="category",
-            inactivity_reminder_hours=None,
-            auto_close_hours=None,
-            transcript_retention_days=30,
-            status="queued",
-            categories=[
-                category_config(
-                    key=label,
-                    label=label,
-                    description="Open a private support ticket.",
-                    emoji="🎫",
-                    staff_role_ids=[staff_role.id],
-                )
-            ],
-        )
-        editor = PanelEditorView(self, record, interaction.user.id)
-        editor_message = await interaction.followup.send(
-            f"Panel created in {panel_channel.mention} and queued for publishing.\n{editor.editor_content()}",
-            embed=editor.editor_embed(),
-            view=editor,
-            ephemeral=True,
-            wait=True,
-        )
-        editor.message = editor_message
-        ticket_cog = self.bot.get_cog("TicketsCog")
-        if ticket_cog is not None:
-            from bhbot.cogs.tickets import TicketPanelView
-
-            await interaction.followup.send(
-                "Preview (the dropdown is disabled here):",
-                embed=ticket_cog.ticket_panel_embed(record),
-                view=TicketPanelView(ticket_cog, record, timeout=600, disabled=True),
-                ephemeral=True,
-                allowed_mentions=discord.AllowedMentions.none(),
-            )
 
     @ticket_commands.command(name="panels", description="Open the visual ticket panel manager.")
     @app_commands.guild_only()
