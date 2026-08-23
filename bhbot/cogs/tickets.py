@@ -1306,7 +1306,7 @@ class TicketsCog(commands.Cog):
                 item.get("emoji") or default_subcategory_emoji(index),
                 guild=guild,
             )
-            line = f"{emoji or '•'} **{item.get('label', 'Subcategory')}**"
+            line = f"{f'{emoji} ' if emoji else ''}**{item.get('label', 'Subcategory')}**"
             if item.get("description"):
                 line += f" — {item['description']}"
             lines.append(line)

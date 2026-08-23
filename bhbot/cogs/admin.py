@@ -1050,7 +1050,7 @@ class PanelSubcategorySelect(discord.ui.Select[Any]):
 class PanelSubcategoryManagerButton(discord.ui.Button[Any]):
     def __init__(self, manager: "PanelSubcategoryManagerView", action: str) -> None:
         super().__init__(
-            label={"add": "Add", "edit": "Edit", "remove": "Remove"}[action],
+            label={"add": "Add", "edit": "Edit", "remove": "Remove", "prompt": "Edit prompt"}[action],
             style=discord.ButtonStyle.danger if action == "remove" else discord.ButtonStyle.secondary,
             row=1,
             custom_id=f"ticket-subcategories-{action}:{manager.editor.panel_id}",
@@ -1059,6 +1059,9 @@ class PanelSubcategoryManagerButton(discord.ui.Button[Any]):
         self.action = action
 
     async def callback(self, interaction: discord.Interaction) -> None:
+        if self.action == "prompt":
+            await interaction.response.send_modal(PanelSubcategoryPromptModal(self.manager))
+            return
         selected = next(
             (
                 item
@@ -1143,15 +1146,16 @@ class PanelSubcategoryManagerView(SafeView):
         self.add_item(PanelSubcategoryManagerButton(self, "add"))
         self.add_item(PanelSubcategoryManagerButton(self, "edit"))
         self.add_item(PanelSubcategoryManagerButton(self, "remove"))
+        self.add_item(PanelSubcategoryManagerButton(self, "prompt"))
 
     def manager_embed(self) -> discord.Embed:
         guild = self.editor.cog.bot.get_guild(int(self.editor.record.panel.guild_id))
         lines = []
         for index, item in enumerate(self.category.subcategories[:25]):
-            emoji = item.get("emoji") or default_subcategory_emoji(index) or "•"
+            emoji = item.get("emoji") or default_subcategory_emoji(index)
             rendered = safe_component_emoji(emoji, guild=guild)
             lines.append(
-                f"{rendered or '•'} **{item.get('label', 'Subcategory')}**"
+                f"{f'{rendered} ' if rendered else ''}**{item.get('label', 'Subcategory')}**"
                 f" — {item.get('description') or 'No description'}"
             )
         prompt = self.category.subcategory_prompt or "Choose a reason for opening this ticket."
@@ -1168,6 +1172,41 @@ class PanelSubcategoryManagerView(SafeView):
             inline=False,
         )
         return embed
+
+
+class PanelSubcategoryPromptModal(PanelEditorModal):
+    def __init__(self, manager: PanelSubcategoryManagerView) -> None:
+        super().__init__(
+            manager.editor,
+            manager.editor_message,
+            title="Edit subcategory prompt",
+        )
+        self.manager = manager
+        self.prompt_input = discord.ui.TextInput(
+            label="Prompt shown before subcategory choices",
+            style=discord.TextStyle.paragraph,
+            default=manager.category.subcategory_prompt
+            or "Choose a reason for opening this ticket.",
+            max_length=200,
+        )
+        self.add_item(self.prompt_input)
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        current = await self.editor.current_record()
+        current_category = (
+            next((item for item in current.categories if item.id == self.manager.category.id), None)
+            if current is not None
+            else None
+        )
+        if current is None or current_category is None:
+            await respond_ephemeral(interaction, "The ticket category changed while you were editing it.")
+            return
+        categories = category_configs(current.categories)
+        category_index = next(
+            index for index, item in enumerate(current.categories) if item.id == current_category.id
+        )
+        categories[category_index]["subcategory_prompt"] = self.prompt_input.value.strip()
+        await self.apply_changes(interaction, {}, categories)
 
 
 class PanelSubcategoryModal(PanelEditorModal):

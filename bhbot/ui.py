@@ -11,6 +11,7 @@ import discord
 logger = logging.getLogger(__name__)
 
 _CUSTOM_EMOJI_PATTERN = re.compile(r"^<a?:[A-Za-z0-9_~]+:\d{15,25}>$")
+_KEYCAP_EMOJI_PATTERN = re.compile(r"^[0-9#*]\ufe0f?\u20e3$")
 _EMOJI_SINGLETONS = {
     0x00A9,
     0x00AE,
@@ -48,6 +49,8 @@ def safe_component_emoji(
     normalized = value.strip()
     if not normalized:
         return None
+    if _KEYCAP_EMOJI_PATTERN.fullmatch(normalized):
+        return normalized
     if _CUSTOM_EMOJI_PATTERN.fullmatch(normalized):
         parsed = discord.PartialEmoji.from_str(normalized)
         if parsed.id is None or not parsed.name:
