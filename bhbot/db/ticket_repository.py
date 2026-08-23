@@ -748,6 +748,63 @@ class TicketRepository:
     async def get_ticket(self, ticket_id: uuid.UUID) -> TicketRecord | None:
         return await self._ticket_record("t.id=?", (str(ticket_id),))
 
+    async def change_ticket_category(
+        self,
+        *,
+        ticket_id: uuid.UUID,
+        category_id: uuid.UUID,
+        actor_id: int,
+    ) -> bool:
+        def change(connection: Any) -> bool:
+            ticket = _one(
+                connection,
+                """
+                SELECT t.*, old_category.key AS old_category_key
+                FROM tickets t
+                JOIN ticket_panel_categories old_category ON old_category.id=t.category_id
+                WHERE t.id=? AND t.status NOT IN ('creating', 'failed', 'deleted')
+                """,
+                (str(ticket_id),),
+            )
+            if ticket is None:
+                return False
+            category = _one(
+                connection,
+                """
+                SELECT c.* FROM ticket_panel_categories c
+                JOIN tickets t ON t.panel_id=c.panel_id
+                WHERE t.id=? AND c.id=? AND c.active=1
+                """,
+                (str(ticket_id), str(category_id)),
+            )
+            if category is None:
+                return False
+            if str(ticket["category_id"]) == str(category_id):
+                return True
+            now = _timestamp(_now())
+            connection.execute(
+                "UPDATE tickets SET category_id=?, updated_at=? WHERE id=?",
+                (str(category_id), now, str(ticket_id)),
+            )
+            _audit(
+                connection,
+                guild_id=str(ticket["guild_id"]),
+                event_type="tickets.category_changed",
+                actor_id=actor_id,
+                target_id=str(ticket["requester_id"]),
+                channel_id=str(ticket["channel_id"]) if ticket["channel_id"] else None,
+                correlation_id=ticket_id,
+                details={
+                    "old_category_id": str(ticket["category_id"]),
+                    "old_category_key": str(ticket["old_category_key"]),
+                    "new_category_id": str(category_id),
+                    "new_category_key": str(category["key"]),
+                },
+            )
+            return True
+
+        return await self.database.transaction(change)
+
     async def active_channel_order(self, *, guild_id: int, open_category_id: int) -> list[str]:
         rows = await self.database.query(
             """

@@ -425,6 +425,7 @@ class TicketButton(discord.ui.Button["TicketControlsView"]):
                 "archive": "📦",
                 "note": "📝",
                 "delete": "🗑️",
+                "category": "🗂️",
             }.get(action),
             style=style,
             custom_id=f"ticket:{ticket_id}:{action}",
@@ -457,6 +458,20 @@ class TicketButton(discord.ui.Button["TicketControlsView"]):
             return
         if self.action == "delete":
             await interaction.response.send_modal(TicketDeleteModal(self.cog, record.ticket.id))
+            return
+        if self.action == "category":
+            panel_record = await self.cog.repository.get_panel(
+                guild_id=int(record.panel.guild_id),
+                panel_id=record.panel.id,
+            )
+            if panel_record is None:
+                await respond_ephemeral(interaction, "This ticket panel is no longer available.")
+                return
+            await interaction.response.send_message(
+                "Choose the new ticket category.",
+                view=TicketCategoryView(self.cog, record, panel_record.categories),
+                ephemeral=True,
+            )
             return
         await interaction.response.defer(ephemeral=True, thinking=True)
         if self.action == "claim":
@@ -606,6 +621,108 @@ class TicketPrioritySelect(discord.ui.Select["TicketControlsView"]):
         )
 
 
+class TicketCategorySelect(discord.ui.Select["TicketCategoryView"]):
+    def __init__(
+        self,
+        cog: "TicketsCog",
+        record: TicketRecord,
+        categories: list[TicketPanelCategory],
+    ) -> None:
+        guild = cog.bot.get_guild(int(record.ticket.guild_id))
+        options = [
+            discord.SelectOption(
+                label=category.label[:100],
+                value=str(category.id),
+                description=(category.description or "No description")[:100],
+                emoji=safe_component_emoji(category.emoji, guild=guild),
+                default=category.id == record.category.id,
+            )
+            for category in categories[:25]
+            if category.active
+        ]
+        if not options:
+            options = [discord.SelectOption(label="No categories available", value="none")]
+        super().__init__(
+            custom_id=f"ticket:{record.ticket.id}:category-select",
+            placeholder="Choose a ticket category",
+            min_values=1,
+            max_values=1,
+            options=options,
+        )
+        self.cog = cog
+        self.categories = categories
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        record = await self.cog.interaction_ticket(interaction, require_staff=True)
+        if record is None:
+            return
+        try:
+            category_id = uuid.UUID(self.values[0])
+        except ValueError:
+            await interaction.response.send_message(
+                "No ticket category is available.", ephemeral=True
+            )
+            return
+        selected = next(
+            (
+                category
+                for category in self.categories
+                if category.id == category_id and category.active
+            ),
+            None,
+        )
+        if selected is None:
+            await interaction.response.send_message(
+                "That ticket category is no longer available.", ephemeral=True
+            )
+            return
+        if selected.id == record.category.id:
+            await interaction.response.send_message(
+                f"This ticket is already in **{selected.label}**.", ephemeral=True
+            )
+            return
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        changed = await self.cog.repository.change_ticket_category(
+            ticket_id=record.ticket.id,
+            category_id=selected.id,
+            actor_id=interaction.user.id,
+        )
+        if changed:
+            old_staff_role_ids = set(
+                record.category.staff_role_ids or record.panel.staff_role_ids
+            )
+            new_staff_role_ids = set(
+                selected.staff_role_ids or record.panel.staff_role_ids
+            )
+            await self.cog.remove_obsolete_ticket_role_access(
+                record,
+                old_staff_role_ids - new_staff_role_ids,
+            )
+            await self.cog.refresh_ticket_state(
+                record.ticket.id,
+                force_staff_member_refresh=True,
+            )
+        await interaction.edit_original_response(
+            content=(
+                f"Ticket category changed to **{selected.label}**."
+                if changed
+                else "The ticket category could not be changed because the ticket is no longer available."
+            ),
+            view=None,
+        )
+
+
+class TicketCategoryView(SafeView):
+    def __init__(
+        self,
+        cog: "TicketsCog",
+        record: TicketRecord,
+        categories: list[TicketPanelCategory],
+    ) -> None:
+        super().__init__(timeout=300)
+        self.add_item(TicketCategorySelect(cog, record, categories))
+
+
 class TicketControlsView(SafeView):
     def __init__(
         self,
@@ -629,6 +746,16 @@ class TicketControlsView(SafeView):
                 "delete",
                 "Delete ticket",
                 discord.ButtonStyle.danger,
+                row=4,
+            )
+        )
+        self.add_item(
+            TicketButton(
+                cog,
+                ticket_id,
+                "category",
+                "Change category",
+                discord.ButtonStyle.secondary,
                 row=4,
             )
         )
@@ -1103,6 +1230,39 @@ class TicketsCog(commands.Cog):
             return False
         return True
 
+    async def remove_obsolete_ticket_role_access(
+        self,
+        record: TicketRecord,
+        obsolete_role_ids: set[str],
+    ) -> None:
+        if not obsolete_role_ids or not record.ticket.channel_id:
+            return
+        channel = self.bot.get_channel(int(record.ticket.channel_id))
+        if channel is None:
+            try:
+                channel = await self.bot.fetch_channel(int(record.ticket.channel_id))
+            except discord.HTTPException:
+                return
+        if not isinstance(channel, discord.TextChannel):
+            return
+        for role_id in obsolete_role_ids:
+            role = channel.guild.get_role(int(role_id))
+            if role is None:
+                continue
+            try:
+                await channel.set_permissions(
+                    role,
+                    overwrite=None,
+                    reason="Remove obsolete ticket category staff access",
+                )
+            except (discord.Forbidden, discord.HTTPException):
+                logger.warning(
+                    "Could not remove obsolete ticket role access for %s on ticket %s",
+                    role.id,
+                    record.ticket.id,
+                    exc_info=True,
+                )
+
     async def add_staff_to_thread(
         self,
         thread: discord.Thread,
@@ -1183,6 +1343,7 @@ class TicketsCog(commands.Cog):
         record: TicketRecord,
         *,
         changed_member: discord.Member | None = None,
+        force_member_refresh: bool = False,
     ) -> None:
         ticket = record.ticket
         self._index_ticket_staff_roles(record)
@@ -1245,6 +1406,7 @@ class TicketsCog(commands.Cog):
                                 existing_channel,
                                 channel.guild,
                                 staff_role_ids,
+                                force_member_refresh=force_member_refresh,
                                 additional_members=(
                                     [changed_member] if changed_member else None
                                 ),
@@ -1289,7 +1451,7 @@ class TicketsCog(commands.Cog):
             staff_thread,
             channel.guild,
             staff_role_ids,
-            force_member_refresh=thread_was_created,
+            force_member_refresh=thread_was_created or force_member_refresh,
             additional_members=([changed_member] if changed_member else None),
         )
         notified_roles = [
@@ -1346,6 +1508,7 @@ class TicketsCog(commands.Cog):
         *,
         sync_channel_layout: bool = True,
         staff_member: discord.Member | None = None,
+        force_staff_member_refresh: bool = False,
     ) -> None:
         record = await self.repository.get_ticket(ticket_id)
         if record is None or not record.ticket.channel_id:
@@ -1371,7 +1534,11 @@ class TicketsCog(commands.Cog):
                 view=TicketRequesterView(self, ticket_id) if active else None,
                 allowed_mentions=discord.AllowedMentions.none(),
             )
-            await self.ensure_staff_controls(record, changed_member=staff_member)
+            await self.ensure_staff_controls(
+                record,
+                changed_member=staff_member,
+                force_member_refresh=force_staff_member_refresh,
+            )
             record = await self.repository.get_ticket(ticket_id) or record
             if record.ticket.staff_thread_id and record.ticket.staff_control_message_id:
                 staff_channel = self.bot.get_channel(int(record.ticket.staff_thread_id))
