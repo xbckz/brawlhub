@@ -217,6 +217,7 @@ class TicketPanelSelect(discord.ui.Select["TicketPanelView"]):
     ) -> None:
         category_labels = category_labels or {}
         category_descriptions = category_descriptions or {}
+        guild = cog.bot.get_guild(int(record.panel.guild_id))
         super().__init__(
             custom_id=f"ticket-panel:{record.panel.id}",
             placeholder=(placeholder or record.panel.select_placeholder)[:150],
@@ -228,7 +229,7 @@ class TicketPanelSelect(discord.ui.Select["TicketPanelView"]):
                     description=(
                         category_descriptions.get(item.id, item.description or "")[:100] or None
                     ),
-                    emoji=safe_component_emoji(item.emoji),
+                    emoji=safe_component_emoji(item.emoji, guild=guild),
                 )
                 for item in record.categories[:25]
             ],

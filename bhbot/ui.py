@@ -27,18 +27,41 @@ _EMOJI_SINGLETONS = {
 
 def safe_component_emoji(
     value: str | discord.Emoji | discord.PartialEmoji | None,
+    guild: discord.Guild | None = None,
 ) -> str | discord.Emoji | discord.PartialEmoji | None:
     """Return an emoji Discord can accept in a component, or no emoji."""
     if value is None:
         return None
     if isinstance(value, (discord.Emoji, discord.PartialEmoji)):
-        return value if value.id is not None else None
+        if value.id is None or not value.name or not re.fullmatch(r"[A-Za-z0-9_~]{1,32}", value.name):
+            return None
+        if guild is not None:
+            server_emoji = discord.utils.get(guild.emojis, id=value.id)
+            if server_emoji is None:
+                return None
+            return discord.PartialEmoji(
+                name=server_emoji.name,
+                id=server_emoji.id,
+                animated=server_emoji.animated,
+            )
+        return discord.PartialEmoji(name=value.name, id=value.id, animated=value.animated)
     normalized = value.strip()
     if not normalized:
         return None
     if _CUSTOM_EMOJI_PATTERN.fullmatch(normalized):
         parsed = discord.PartialEmoji.from_str(normalized)
-        return parsed if parsed.id is not None else None
+        if parsed.id is None or not parsed.name:
+            return None
+        if guild is not None:
+            server_emoji = discord.utils.get(guild.emojis, id=parsed.id)
+            if server_emoji is None:
+                return None
+            return discord.PartialEmoji(
+                name=server_emoji.name,
+                id=server_emoji.id,
+                animated=server_emoji.animated,
+            )
+        return discord.PartialEmoji(name=parsed.name, id=parsed.id, animated=parsed.animated)
 
     codepoints = [ord(character) for character in normalized]
 

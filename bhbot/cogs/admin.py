@@ -172,7 +172,8 @@ class PanelEditorButton(discord.ui.Button[Any]):
 class PanelCategorySelect(discord.ui.Select[Any]):
     def __init__(self, editor: "PanelEditorView") -> None:
         self.editor = editor
-        options = self.options_for(editor.record)
+        guild = editor.cog.bot.get_guild(int(editor.record.panel.guild_id))
+        options = self.options_for(editor.record, guild)
         if not options:
             options = [discord.SelectOption(label="No categories", value="__none__")]
         super().__init__(
@@ -186,13 +187,15 @@ class PanelCategorySelect(discord.ui.Select[Any]):
         )
 
     @staticmethod
-    def options_for(record: TicketPanelRecord) -> list[discord.SelectOption]:
+    def options_for(
+        record: TicketPanelRecord, guild: discord.Guild | None = None
+    ) -> list[discord.SelectOption]:
         return [
             discord.SelectOption(
                 label=item.label[:100],
                 value=str(item.id),
                 description=(item.description or "No description")[:100],
-                emoji=safe_component_emoji(item.emoji),
+                emoji=safe_component_emoji(item.emoji, guild=guild),
             )
             for item in record.categories[:25]
         ]
@@ -400,11 +403,16 @@ class PanelEditorView(SafeView):
             None,
         )
         refreshed.preview_message = self.preview_message
-        await message.edit(
-            content=refreshed.editor_content(),
-            embed=refreshed.editor_embed(),
-            view=refreshed,
-        )
+        try:
+            await message.edit(
+                content=refreshed.editor_content(),
+                embed=refreshed.editor_embed(),
+                view=refreshed,
+            )
+        except (discord.NotFound, discord.Forbidden):
+            logger.debug("The panel editor message is no longer available", exc_info=True)
+            self.message = None
+            return
         if refreshed.preview_message is not None:
             ticket_cog = self.cog.bot.get_cog("TicketsCog")
             if ticket_cog is not None:
