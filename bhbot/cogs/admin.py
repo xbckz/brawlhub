@@ -4,6 +4,7 @@ import io
 import logging
 import re
 import uuid
+from copy import deepcopy
 from typing import Any, cast
 
 import discord
@@ -70,20 +71,29 @@ def subcategory_config(
     label: str,
     description: str | None,
     emoji: str | None,
-) -> dict[str, str | None]:
-    return {
+    response: str = "",
+    children: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    result: dict[str, Any] = {
         "key": category_key(key),
         "label": label[:100],
         "description": description[:100] if description else None,
         "emoji": emoji[:100] if emoji else None,
+        "response": response[:2000],
     }
+    if children is not None:
+        result["children"] = {
+            "prompt": str(children.get("prompt") or "Choose an option.")[:1000],
+            "options": deepcopy(children.get("options") or [])[:25],
+        }
+    return result
 
 
 def category_config(
     *,
     target_category_id: int | None,
     subcategory_prompt: str,
-    subcategories: list[dict[str, str | None]],
+    subcategories: list[dict[str, Any]],
     key: str,
     label: str,
     description: str | None,
@@ -93,8 +103,8 @@ def category_config(
 ) -> TicketCategoryConfig:
     return {
         "target_category_id": target_category_id,
-        "subcategory_prompt": subcategory_prompt[:200],
-        "subcategories": subcategories[:25],
+        "subcategory_prompt": subcategory_prompt[:1000],
+        "subcategories": deepcopy(subcategories[:25]),
         "key": category_key(key),
         "label": label[:100],
         "description": description[:100] if description else None,
@@ -348,7 +358,7 @@ class PanelEditorView(SafeView):
         self.add_item(PanelEditorButton(self, "Routes", "routes", 1))
         self.add_item(PanelEditorButton(self, "Panel emoji", "panel-emoji", 2))
         self.add_item(PanelEditorButton(self, "Edit category emoji", "category-emoji", 2))
-        self.add_item(PanelEditorButton(self, "Subcategories", "subcategories", 2))
+        self.add_item(PanelEditorButton(self, "Ticket questions", "subcategories", 2))
         self.category_select = PanelCategorySelect(self)
         self.add_item(self.category_select)
 
@@ -376,7 +386,7 @@ class PanelEditorView(SafeView):
                     f"{item.emoji or '•'} **{item.label}** — {item.description or 'No description'}\n"
                     f"Target: <#{item.target_category_id or panel.open_category_id}> · "
                     f"Ping: {', '.join(f'<@&{role_id}>' for role_id in (item.staff_role_ids or panel.staff_role_ids))} · "
-                    f"Subcategories: {len(item.subcategories)}"
+                    f"First-question options: {len(item.subcategories)}"
                 )
                 for item in self.record.categories[:25]
             )[:1024]
@@ -622,7 +632,7 @@ class PanelEditorView(SafeView):
                 return
             manager = PanelSubcategoryManagerView(self, message, selected)
             await interaction.response.send_message(
-                f"Manage the subcategories shown after **{selected.label}** is selected.",
+                f"Manage the questions and emoji responses inside **{selected.label}** tickets.",
                 embed=manager.manager_embed(),
                 view=manager,
                 ephemeral=True,
@@ -1014,46 +1024,91 @@ class PanelCategoryRoutingView(SafeView):
         self.add_item(PanelCategoryRoutingContinueButton(self))
 
 
+def _config_node(category: dict[str, Any], path: tuple[str, ...], *, create: bool = False) -> dict[str, Any] | None:
+    node: dict[str, Any] = {
+        "prompt": category["subcategory_prompt"],
+        "options": category["subcategories"],
+    }
+    for key in path:
+        selected = next((item for item in node["options"] if item.get("key") == key), None)
+        if selected is None:
+            return None
+        children = selected.get("children")
+        if not isinstance(children, dict):
+            if not create:
+                return None
+            children = {"prompt": "Choose an option.", "options": []}
+            selected["children"] = children
+        children.setdefault("prompt", "Choose an option.")
+        children.setdefault("options", [])
+        node = children
+    return node
+
+
+def _model_node(category: TicketPanelCategory, path: tuple[str, ...]) -> tuple[str, list[dict[str, Any]]]:
+    prompt = category.subcategory_prompt or "Choose a reason for opening this ticket."
+    options: list[dict[str, Any]] = category.subcategories
+    for key in path:
+        selected = next((item for item in options if item.get("key") == key), None)
+        if selected is None or not isinstance(selected.get("children"), dict):
+            return prompt, []
+        children = selected["children"]
+        prompt = str(children.get("prompt") or "Choose an option.")
+        options = list(children.get("options") or [])
+    return prompt, options
+
+
 class PanelSubcategorySelect(discord.ui.Select[Any]):
     def __init__(self, manager: "PanelSubcategoryManagerView") -> None:
         self.manager = manager
         guild = manager.editor.cog.bot.get_guild(int(manager.editor.record.panel.guild_id))
-        options = [
+        _, options = _model_node(manager.category, manager.path)
+        select_options = [
             discord.SelectOption(
-                label=str(item.get("label", "Subcategory"))[:100],
+                label=str(item.get("label", "Option"))[:100],
                 value=str(item.get("key", "")),
                 description=(str(item.get("description")) if item.get("description") else None),
                 emoji=safe_component_emoji(
-                    item.get("emoji") or default_subcategory_emoji(index),
-                    guild=guild,
+                    item.get("emoji") or default_subcategory_emoji(index), guild=guild
                 ),
             )
-            for index, item in enumerate(manager.category.subcategories[:25])
+            for index, item in enumerate(options[:25])
         ]
         super().__init__(
-            placeholder="Select a subcategory to edit or remove",
+            placeholder="Select an option to edit, remove, or open its next layer",
             min_values=1,
             max_values=1,
-            options=options,
+            options=select_options,
             row=0,
-            custom_id=f"ticket-subcategories-select:{manager.editor.panel_id}",
+            custom_id=f"ticket-subcategories-select:{manager.editor.panel_id}:{len(manager.path)}",
         )
 
     async def callback(self, interaction: discord.Interaction) -> None:
         self.manager.selected_key = self.values[0]
-        await interaction.response.edit_message(
-            embed=self.manager.manager_embed(),
-            view=self.manager,
-        )
+        await interaction.response.edit_message(embed=self.manager.manager_embed(), view=self.manager)
 
 
 class PanelSubcategoryManagerButton(discord.ui.Button[Any]):
     def __init__(self, manager: "PanelSubcategoryManagerView", action: str) -> None:
+        labels = {
+            "add": "Add",
+            "edit": "Edit",
+            "remove": "Remove",
+            "next": "Next layer",
+            "prompt": "Edit question",
+            "back": "Back",
+        }
         super().__init__(
-            label={"add": "Add", "edit": "Edit", "remove": "Remove", "prompt": "Edit prompt"}[action],
-            style=discord.ButtonStyle.danger if action == "remove" else discord.ButtonStyle.secondary,
-            row=1,
-            custom_id=f"ticket-subcategories-{action}:{manager.editor.panel_id}",
+            label=labels[action],
+            style=(
+                discord.ButtonStyle.danger
+                if action == "remove"
+                else discord.ButtonStyle.primary
+                if action == "next"
+                else discord.ButtonStyle.secondary
+            ),
+            row=2 if action == "back" else 1,
+            custom_id=f"ticket-subcategories-{action}:{manager.editor.panel_id}:{len(manager.path)}",
         )
         self.manager = manager
         self.action = action
@@ -1062,68 +1117,92 @@ class PanelSubcategoryManagerButton(discord.ui.Button[Any]):
         if self.action == "prompt":
             await interaction.response.send_modal(PanelSubcategoryPromptModal(self.manager))
             return
-        selected = next(
-            (
-                item
-                for item in self.manager.category.subcategories
-                if str(item.get("key")) == self.manager.selected_key
-            ),
-            None,
-        )
-        if self.action in {"edit", "remove"} and selected is None:
-            await respond_ephemeral(interaction, "Select a subcategory first.")
+        if self.action == "back":
+            if not self.manager.path:
+                await respond_ephemeral(interaction, "You are already at the first question.")
+                return
+            parent = PanelSubcategoryManagerView(
+                self.manager.editor,
+                self.manager.editor_message,
+                self.manager.category,
+                path=self.manager.path[:-1],
+            )
+            await interaction.response.edit_message(embed=parent.manager_embed(), view=parent)
+            return
+
+        _, options = _model_node(self.manager.category, self.manager.path)
+        selected = next((item for item in options if str(item.get("key")) == self.manager.selected_key), None)
+        if self.action in {"edit", "remove", "next"} and selected is None:
+            await respond_ephemeral(interaction, "Select an option first.")
             return
         if self.action == "add":
             await interaction.response.send_modal(
-                PanelSubcategoryModal(
-                    self.manager,
-                    None,
-                    position=len(self.manager.category.subcategories),
-                )
+                PanelSubcategoryModal(self.manager, None, position=len(options))
             )
             return
         if self.action == "edit":
             await interaction.response.send_modal(
-                PanelSubcategoryModal(
-                    self.manager,
-                    selected,
-                    position=self.manager.category.subcategories.index(selected),
-                )
+                PanelSubcategoryModal(self.manager, selected, position=options.index(selected))
             )
             return
+
         await interaction.response.defer(ephemeral=True, thinking=True)
         current = await self.manager.editor.current_record()
         current_category = (
             next((item for item in current.categories if item.id == self.manager.category.id), None)
-            if current is not None
-            else None
+            if current is not None else None
         )
         if current is None or current_category is None:
-            await interaction.followup.send("The category changed while you were editing it. Reopen the panel editor.", ephemeral=True)
+            await interaction.followup.send(
+                "The category changed while you were editing it. Reopen the panel editor.", ephemeral=True
+            )
             return
         categories = category_configs(current.categories)
         category_index = next(index for index, item in enumerate(current.categories) if item.id == current_category.id)
-        categories[category_index]["subcategories"] = [
-            item for item in categories[category_index]["subcategories"]
-            if item["key"] != self.manager.selected_key
-        ]
+        node = _config_node(categories[category_index], self.manager.path, create=self.action == "next")
+        if node is None:
+            await interaction.followup.send("That question no longer exists. Reopen the editor.", ephemeral=True)
+            return
+        if self.action == "remove":
+            node["options"] = [item for item in node["options"] if item.get("key") != self.manager.selected_key]
+        else:
+            selected_config = next(
+                (item for item in node["options"] if item.get("key") == self.manager.selected_key), None
+            )
+            if selected_config is None:
+                await interaction.followup.send("That option is no longer available.", ephemeral=True)
+                return
+            selected_config.setdefault(
+                "children", {"prompt": "Choose an option.", "options": []}
+            )
         updated = await self.manager.editor.persist({}, categories)
         if updated is None:
             await interaction.followup.send("The panel changed while you were editing it. Reopen the panel editor.", ephemeral=True)
             return
         refreshed = await self.manager.editor.refresh_message(self.manager.editor_message)
-        reopened = False
-        if not refreshed:
-            reopened = await self.manager.editor.send_fresh_editor(interaction, updated)
+        if self.action == "next":
+            updated_category = next(item for item in updated.categories if item.id == current_category.id)
+            child = PanelSubcategoryManagerView(
+                self.manager.editor,
+                self.manager.editor_message,
+                updated_category,
+                path=self.manager.path + (str(self.manager.selected_key),),
+            )
+            await interaction.followup.send(
+                content="Edit this question and its emoji responses. Each response can open another layer.",
+                embed=child.manager_embed(),
+                view=child,
+                ephemeral=True,
+            )
         await interaction.followup.send(
             (
-                "Subcategory removed and the full editor preview was refreshed."
-                if refreshed
-                else (
-                    "Subcategory removed and a fresh editor was opened for you."
-                    if reopened
-                    else "Subcategory removed, but Discord would not reopen the editor. Run /ticket panels again."
-                )
+                "Option removed and the full editor preview was refreshed."
+                if self.action == "remove" and refreshed
+                else "Next question opened. The full editor preview was refreshed."
+                if self.action == "next" and refreshed
+                else "Option removed, but reopen the panel editor to continue."
+                if self.action == "remove"
+                else "Next question saved, but reopen the panel editor to continue."
             ),
             ephemeral=True,
         )
@@ -1135,59 +1214,70 @@ class PanelSubcategoryManagerView(SafeView):
         editor: PanelEditorView,
         editor_message: discord.Message,
         category: TicketPanelCategory,
+        *,
+        path: tuple[str, ...] = (),
     ) -> None:
         super().__init__(timeout=600)
         self.editor = editor
         self.editor_message = editor_message
         self.category = category
+        self.path = path
         self.selected_key: str | None = None
-        if category.subcategories:
+        _, options = _model_node(category, path)
+        if options:
             self.add_item(PanelSubcategorySelect(self))
         self.add_item(PanelSubcategoryManagerButton(self, "add"))
         self.add_item(PanelSubcategoryManagerButton(self, "edit"))
         self.add_item(PanelSubcategoryManagerButton(self, "remove"))
+        self.add_item(PanelSubcategoryManagerButton(self, "next"))
         self.add_item(PanelSubcategoryManagerButton(self, "prompt"))
+        if path:
+            self.add_item(PanelSubcategoryManagerButton(self, "back"))
 
     def manager_embed(self) -> discord.Embed:
         guild = self.editor.cog.bot.get_guild(int(self.editor.record.panel.guild_id))
+        prompt, options = _model_node(self.category, self.path)
         lines = []
-        for index, item in enumerate(self.category.subcategories[:25]):
-            emoji = item.get("emoji") or default_subcategory_emoji(index)
-            rendered = safe_component_emoji(emoji, guild=guild)
+        for index, item in enumerate(options[:25]):
+            rendered = safe_component_emoji(item.get("emoji") or default_subcategory_emoji(index), guild=guild)
+            response = str(item.get("response") or "No response configured")
+            child_text = " · opens another question" if isinstance(item.get("children"), dict) else ""
             lines.append(
-                f"{f'{rendered} ' if rendered else ''}**{item.get('label', 'Subcategory')}**"
-                f" — {item.get('description') or 'No description'}"
+                f"{f'{rendered} ' if rendered else ''}**{item.get('label', 'Option')}**"
+                f" — {item.get('description') or 'No description'}{child_text}\n"
+                f"Response: {response[:180]}"
             )
-        prompt = self.category.subcategory_prompt or "Choose a reason for opening this ticket."
+        path_text = " → ".join(
+            next((str(item.get("label", key)) for item in self.category.subcategories if item.get("key") == key), key)
+            for key in self.path
+        )
+        title = f"Question: {self.category.label}" + (f" → {path_text}" if path_text else "")
         embed = themed_embed(
             "ticket",
-            title=f"Subcategories: {self.category.label}",
-            description=f"Prompt: {prompt}",
+            title=title[:256],
+            description=f"Normal message question: {prompt}",
             color=self.editor.record.panel.color,
             emoji=self.editor.record.panel.emoji,
         )
         embed.add_field(
-            name=f"Options ({len(self.category.subcategories)}/25)",
-            value="\n".join(lines)[:1024] or "No subcategories configured yet.",
+            name=f"Options ({len(options)}/25)",
+            value="\n".join(lines)[:1024] or "No options configured yet.",
             inline=False,
         )
+        embed.set_footer(text="Select an option, then use Next layer to add another question.")
         return embed
 
 
 class PanelSubcategoryPromptModal(PanelEditorModal):
     def __init__(self, manager: PanelSubcategoryManagerView) -> None:
-        super().__init__(
-            manager.editor,
-            manager.editor_message,
-            title="Edit subcategory prompt",
-        )
+        super().__init__(manager.editor, manager.editor_message, title="Edit question message")
         self.manager = manager
+        prompt, _ = _model_node(manager.category, manager.path)
         self.prompt_input = discord.ui.TextInput(
-            label="Prompt shown before subcategory choices",
+            label="Normal message shown in the ticket",
             style=discord.TextStyle.paragraph,
-            default=manager.category.subcategory_prompt
-            or "Choose a reason for opening this ticket.",
-            max_length=200,
+            default=prompt,
+            max_length=1000,
         )
         self.add_item(self.prompt_input)
 
@@ -1195,17 +1285,21 @@ class PanelSubcategoryPromptModal(PanelEditorModal):
         current = await self.editor.current_record()
         current_category = (
             next((item for item in current.categories if item.id == self.manager.category.id), None)
-            if current is not None
-            else None
+            if current is not None else None
         )
         if current is None or current_category is None:
             await respond_ephemeral(interaction, "The ticket category changed while you were editing it.")
             return
         categories = category_configs(current.categories)
-        category_index = next(
-            index for index, item in enumerate(current.categories) if item.id == current_category.id
-        )
-        categories[category_index]["subcategory_prompt"] = self.prompt_input.value.strip()
+        category_index = next(index for index, item in enumerate(current.categories) if item.id == current_category.id)
+        node = _config_node(categories[category_index], self.manager.path)
+        if node is None:
+            await respond_ephemeral(interaction, "That question no longer exists. Reopen the editor.")
+            return
+        if self.manager.path:
+            node["prompt"] = self.prompt_input.value.strip() or "Choose an option."
+        else:
+            categories[category_index]["subcategory_prompt"] = self.prompt_input.value.strip()
         await self.apply_changes(interaction, {}, categories)
 
 
@@ -1213,25 +1307,25 @@ class PanelSubcategoryModal(PanelEditorModal):
     def __init__(
         self,
         manager: PanelSubcategoryManagerView,
-        existing: dict[str, str | None] | None,
+        existing: dict[str, Any] | None,
         *,
         position: int,
     ) -> None:
         super().__init__(
             manager.editor,
             manager.editor_message,
-            title="Edit ticket subcategory" if existing else "Add ticket subcategory",
+            title="Edit emoji option" if existing else "Add emoji option",
         )
         self.manager = manager
         self.existing = existing
         self.position = position
         self.label_input = discord.ui.TextInput(
-            label="Subcategory label",
+            label="Option label",
             default=existing.get("label", "") if existing else "",
             max_length=100,
         )
         self.description_input = discord.ui.TextInput(
-            label="Subcategory description",
+            label="Option description",
             style=discord.TextStyle.paragraph,
             default=existing.get("description", "") if existing else "",
             required=False,
@@ -1243,65 +1337,73 @@ class PanelSubcategoryModal(PanelEditorModal):
             required=False,
             max_length=100,
         )
-        for item in (self.label_input, self.description_input, self.emoji_input):
+        self.response_input = discord.ui.TextInput(
+            label="Response message after this emoji",
+            style=discord.TextStyle.paragraph,
+            default=existing.get("response", "") if existing else "",
+            required=False,
+            max_length=2000,
+        )
+        for item in (self.label_input, self.description_input, self.emoji_input, self.response_input):
             self.add_item(item)
 
     async def on_submit(self, interaction: discord.Interaction) -> None:
         label = self.label_input.value.strip()
         if not label:
-            await respond_ephemeral(interaction, "Subcategory label cannot be empty.")
+            await respond_ephemeral(interaction, "Option label cannot be empty.")
             return
         current = await self.editor.current_record()
         current_category = (
             next((item for item in current.categories if item.id == self.manager.category.id), None)
-            if current is not None
-            else None
+            if current is not None else None
         )
         if current is None or current_category is None:
             await respond_ephemeral(interaction, "The ticket category changed while you were editing it.")
             return
+        _, sibling_options = _model_node(current_category, self.manager.path)
         key = category_key(label)
         if any(
             str(item.get("key")) == key
             and (self.existing is None or item.get("key") != self.existing.get("key"))
-            for item in current_category.subcategories
+            for item in sibling_options
         ):
-            await respond_ephemeral(interaction, "That subcategory key already exists.")
+            await respond_ephemeral(interaction, "That option key already exists at this question.")
             return
-        emoji = normalize_component_emoji(self.emoji_input.value, interaction.guild)
-        if not emoji:
-            emoji = default_subcategory_emoji(self.position)
+        emoji = normalize_component_emoji(self.emoji_input.value, interaction.guild) or default_subcategory_emoji(self.position)
         if emoji and any(
             item.get("emoji") == emoji
             and (self.existing is None or item.get("key") != self.existing.get("key"))
-            for item in current_category.subcategories
+            for item in sibling_options
         ):
-            await respond_ephemeral(interaction, "Each subcategory must use a different emoji.")
+            await respond_ephemeral(interaction, "Each option at the same question must use a different emoji.")
             return
+        children = deepcopy(self.existing.get("children")) if self.existing and isinstance(self.existing.get("children"), dict) else None
         replacement = subcategory_config(
             key=key,
             label=label,
             description=self.description_input.value.strip() or None,
             emoji=emoji,
+            response=self.response_input.value.strip(),
+            children=children,
         )
-        subcategories = [dict(item) for item in current_category.subcategories]
-        if self.existing is None:
-            if len(subcategories) >= 25:
-                await respond_ephemeral(interaction, "Discord supports a maximum of 25 subcategories here.")
-                return
-            subcategories.append(replacement)
-        else:
-            index = next(
-                (index for index, item in enumerate(subcategories) if item.get("key") == self.existing.get("key")),
-                None,
-            )
-            if index is None:
-                await respond_ephemeral(interaction, "That subcategory is no longer available. Reopen the editor.")
-                return
-            subcategories[index] = replacement
         categories = category_configs(current.categories)
         category_index = next(index for index, item in enumerate(current.categories) if item.id == current_category.id)
-        categories[category_index]["subcategories"] = subcategories
+        node = _config_node(categories[category_index], self.manager.path)
+        if node is None:
+            await respond_ephemeral(interaction, "That question no longer exists. Reopen the editor.")
+            return
+        options = node["options"]
+        if self.existing is None:
+            if len(options) >= 25:
+                await respond_ephemeral(interaction, "Discord supports a maximum of 25 options per question.")
+                return
+            options.append(replacement)
+        else:
+            index = next((index for index, item in enumerate(options) if item.get("key") == self.existing.get("key")), None)
+            if index is None:
+                await respond_ephemeral(interaction, "That option is no longer available. Reopen the editor.")
+                return
+            options[index] = replacement
         await self.apply_changes(interaction, {}, categories)
 
 
@@ -1323,7 +1425,7 @@ class PanelCategoryModal(PanelEditorModal):
         self.description_input = discord.ui.TextInput(label="Category description", style=discord.TextStyle.paragraph, default=existing.description if existing and existing.description else "", required=False, max_length=100)
         self.emoji_input = discord.ui.TextInput(label="Category emoji (Unicode/server emoji)", default=existing.emoji if existing and existing.emoji else "", required=False, max_length=100)
         self.subcategory_prompt_input = discord.ui.TextInput(
-            label="Subcategory prompt",
+            label="First question message",
             style=discord.TextStyle.paragraph,
             default=(
                 existing.subcategory_prompt
@@ -1331,7 +1433,7 @@ class PanelCategoryModal(PanelEditorModal):
                 else "Choose a reason for opening this ticket."
             ),
             required=False,
-            max_length=200,
+            max_length=1000,
         )
         existing_question = ""
         if existing and existing.form_fields:

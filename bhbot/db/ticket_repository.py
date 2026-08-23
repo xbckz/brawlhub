@@ -30,7 +30,10 @@ class TicketFormFieldConfig(TypedDict):
 class TicketCategoryConfig(TypedDict):
     target_category_id: int | None
     subcategory_prompt: str
-    subcategories: list[dict[str, str | None]]
+    # Each option may contain a response and a nested {prompt, options} node.
+    # Keeping the tree in the existing JSON column also keeps old panels
+    # compatible: flat options simply have no children.
+    subcategories: list[dict[str, Any]]
     key: str
     label: str
     description: str | None
@@ -145,6 +148,29 @@ def _panel(row: dict[str, Any]) -> TicketPanel:
 
 
 def _category(row: dict[str, Any]) -> TicketPanelCategory:
+    def normalize_option(value: object) -> dict[str, Any] | None:
+        if not isinstance(value, dict) or not value.get("key") or not value.get("label"):
+            return None
+        option: dict[str, Any] = {
+            "key": str(value["key"]),
+            "label": str(value["label"]),
+            "description": str(value["description"]) if value.get("description") else None,
+            "emoji": str(value["emoji"]) if value.get("emoji") else None,
+            "response": str(value.get("response") or ""),
+        }
+        children = value.get("children")
+        if isinstance(children, dict):
+            options = [
+                child
+                for raw_child in children.get("options", [])
+                if (child := normalize_option(raw_child)) is not None
+            ][:25]
+            option["children"] = {
+                "prompt": str(children.get("prompt") or "Choose an option."),
+                "options": options,
+            }
+        return option
+
     return TicketPanelCategory(
         id=_uuid(row["id"]),
         panel_id=_uuid(row["panel_id"]),
@@ -153,15 +179,10 @@ def _category(row: dict[str, Any]) -> TicketPanelCategory:
         ),
         subcategory_prompt=str(row.get("subcategory_prompt") or ""),
         subcategories=[
-            {
-                "key": str(item.get("key") or ""),
-                "label": str(item.get("label") or ""),
-                "description": str(item["description"]) if item.get("description") else None,
-                "emoji": str(item["emoji"]) if item.get("emoji") else None,
-            }
-            for item in _json(row.get("subcategories"), [])
-            if isinstance(item, dict) and item.get("key") and item.get("label")
-        ],
+            option
+            for raw_option in _json(row.get("subcategories"), [])
+            if (option := normalize_option(raw_option)) is not None
+        ][:25],
         key=str(row["key"]),
         label=str(row["label"]),
         description=str(row["description"]) if row["description"] is not None else None,

@@ -8,7 +8,7 @@ from collections import defaultdict
 from collections.abc import MutableMapping
 from datetime import UTC, datetime, timedelta
 from time import monotonic
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING, Any, cast
 
 import discord
 from discord import app_commands
@@ -303,6 +303,90 @@ class TicketSubcategoryView(SafeView):
             self.add_item(TicketSubcategoryButton(self, subcategory, position))
 
 
+def ticket_flow_node(category: TicketPanelCategory) -> dict[str, Any]:
+    return {
+        "prompt": category.subcategory_prompt or "Choose a reason for opening this ticket.",
+        "options": category.subcategories[:25],
+    }
+
+
+class TicketFlowOptionButton(discord.ui.Button["TicketFlowView"]):
+    def __init__(self, view: "TicketFlowView", option: dict[str, Any], position: int) -> None:
+        self.option = option
+        emoji = safe_component_emoji(
+            option.get("emoji") or default_subcategory_emoji(position),
+            guild=view.cog.bot.get_guild(int(view.record.panel.guild_id)),
+        )
+        super().__init__(
+            label=str(position + 1) if emoji is None else None,
+            emoji=emoji,
+            style=discord.ButtonStyle.secondary,
+            row=position // 5,
+            custom_id=f"ticket-flow:{view.ticket_id.hex[:8]}:{str(option.get('key', 'option'))[:40]}",
+        )
+        self.flow_view = view
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        if interaction.guild is None or not isinstance(interaction.user, discord.Member):
+            await respond_ephemeral(interaction, "Tickets require a server.")
+            return
+        record = await self.flow_view.cog.interaction_ticket(interaction)
+        if record is None:
+            return
+        if record.ticket.status not in {"open", "claimed"}:
+            await respond_ephemeral(interaction, "This ticket is no longer accepting selections.")
+            return
+        if interaction.user.id != int(record.ticket.requester_id) and not is_ticket_staff(
+            interaction.user, record.panel, record.category
+        ):
+            await respond_ephemeral(interaction, "Only the requester or ticket staff can use this question.")
+            return
+        try:
+            await interaction.response.edit_message(view=None)
+        except discord.HTTPException:
+            if not interaction.response.is_done():
+                await interaction.response.defer()
+        channel = interaction.channel
+        if not isinstance(channel, discord.TextChannel):
+            await respond_ephemeral(interaction, "This ticket channel is no longer available.")
+            return
+        response = str(self.option.get("response") or "").strip()
+        if response:
+            await channel.send(
+                response[:2000],
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+        children = self.option.get("children")
+        if not isinstance(children, dict):
+            return
+        options = [item for item in children.get("options", []) if isinstance(item, dict)][:25]
+        if not options:
+            return
+        await self.flow_view.cog.send_ticket_flow_message(
+            channel,
+            record,
+            {"prompt": str(children.get("prompt") or "Choose an option."), "options": options},
+        )
+
+
+class TicketFlowView(SafeView):
+    def __init__(
+        self,
+        cog: "TicketsCog",
+        ticket_id: uuid.UUID,
+        record: TicketRecord,
+        node: dict[str, Any],
+    ) -> None:
+        super().__init__(timeout=None)
+        self.cog = cog
+        self.ticket_id = ticket_id
+        self.record = record
+        self.node = node
+        for position, option in enumerate(node.get("options", [])[:25]):
+            if isinstance(option, dict):
+                self.add_item(TicketFlowOptionButton(self, option, position))
+
+
 class TicketPanelSelect(discord.ui.Select["TicketPanelView"]):
     def __init__(
         self,
@@ -380,14 +464,11 @@ class TicketPanelSelect(discord.ui.Select["TicketPanelView"]):
             await interaction.response.send_message("This ticket panel is invalid.", ephemeral=True)
             return
         if category.subcategories:
-            await interaction.response.send_message(
-                embed=self.cog.ticket_subcategory_embed(current_record, category),
-                view=TicketSubcategoryView(self.cog, current_record, category),
-                ephemeral=True,
-                allowed_mentions=discord.AllowedMentions.none(),
-            )
-            await self.reset_panel_selector(interaction, current_record)
-            return
+            await interaction.response.defer(ephemeral=True, thinking=True)
+            try:
+                await self.cog.create_ticket(interaction, panel, category, {})
+            finally:
+                await self.reset_panel_selector(interaction, current_record)
         elif category.form_fields:
             await interaction.response.send_modal(TicketRequestModal(self.cog, panel, category))
             await self.reset_panel_selector(interaction, current_record)
@@ -1959,6 +2040,26 @@ class TicketsCog(commands.Cog):
         except discord.HTTPException:
             await respond_ephemeral(interaction, message)
 
+    async def send_ticket_flow_message(
+        self,
+        channel: discord.TextChannel,
+        record: TicketRecord,
+        node: dict[str, Any],
+    ) -> discord.Message:
+        """Send one normal in-ticket question and its emoji button choices."""
+        options = [item for item in node.get("options", []) if isinstance(item, dict)][:25]
+        view = TicketFlowView(
+            self,
+            record.ticket.id,
+            record,
+            {"prompt": node.get("prompt"), "options": options},
+        )
+        return await channel.send(
+            str(node.get("prompt") or "Choose an option.")[:2000],
+            view=view,
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+
     @staticmethod
     def ticket_creation_error_message(error: Exception) -> str:
         if isinstance(error, discord.Forbidden):
@@ -2156,6 +2257,19 @@ class TicketsCog(commands.Cog):
                 logger.exception(
                     "Ticket %s was created but its state refresh failed", ticket.id
                 )
+            if category.subcategories:
+                try:
+                    await self.send_ticket_flow_message(
+                        channel,
+                        TicketRecord(ticket=ticket, panel=panel, category=category),
+                        ticket_flow_node(category),
+                    )
+                except Exception:
+                    # The ticket is already committed. A failed question
+                    # message must not roll back the channel or database row.
+                    logger.exception(
+                        "Ticket %s was created but its first question failed", ticket.id
+                    )
             await self.ticket_creation_response(interaction, f"Your ticket is ready: {channel.mention}")
         except Exception as error_object:
             logger.exception("Ticket %s channel creation failed", ticket.id)
