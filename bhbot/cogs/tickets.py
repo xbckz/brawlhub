@@ -305,7 +305,8 @@ class TicketSubcategoryView(SafeView):
 
 def ticket_flow_node(category: TicketPanelCategory) -> dict[str, Any]:
     return {
-        "prompt": category.subcategory_prompt,
+        "prompt": str(category.subcategory_prompt or "").strip()
+        or "Choose a reason for opening this ticket.",
         "options": category.subcategories[:25],
     }
 
@@ -315,15 +316,15 @@ def ticket_flow_question_content(
 ) -> str:
     """Render a question like a reaction menu, while keeping button controls."""
     lines: list[str] = []
-    prompt = str(node.get("prompt") or "").strip()
-    if prompt:
-        lines.append(prompt)
+    lines.append(str(node.get("prompt") or "").strip() or "Choose an option.")
     for position, option in enumerate(node.get("options", [])[:25]):
         if not isinstance(option, dict):
             continue
         fallback = default_subcategory_emoji(position) or "•"
         rendered = safe_component_emoji(option.get("emoji") or fallback, guild=guild)
-        lines.append(f"{rendered or fallback} {str(option.get('label') or 'Option')[:100]}")
+        label = str(option.get("label") or "").strip()
+        if label:
+            lines.append(f"{rendered or fallback} {label[:100]}")
     return "\n".join(lines)[:2000] or "\u200b"
 
 
@@ -381,7 +382,10 @@ class TicketFlowOptionButton(discord.ui.Button["TicketFlowView"]):
         await self.flow_view.cog.send_ticket_flow_message(
             channel,
             record,
-            {"prompt": str(children.get("prompt") or ""), "options": options},
+            {
+                "prompt": str(children.get("prompt") or "").strip() or "Choose an option.",
+                "options": options,
+            },
         )
 
 
@@ -535,8 +539,7 @@ class TicketCloseModal(SafeModal, title="Close ticket"):
     reason: discord.ui.TextInput["TicketCloseModal"] = discord.ui.TextInput(
         label="Reason",
         style=discord.TextStyle.paragraph,
-        required=True,
-        min_length=3,
+        required=False,
         max_length=1000,
     )
 
@@ -547,7 +550,11 @@ class TicketCloseModal(SafeModal, title="Close ticket"):
 
     async def on_submit(self, interaction: discord.Interaction) -> None:
         await interaction.response.defer(ephemeral=True, thinking=True)
-        await self.cog.close_ticket(interaction, self.ticket_id, str(self.reason.value))
+        await self.cog.close_ticket(
+            interaction,
+            self.ticket_id,
+            str(self.reason.value).strip() or "Closed without a reason.",
+        )
 
 
 class TicketNoteModal(SafeModal, title="Internal staff note"):
@@ -651,7 +658,16 @@ class TicketButton(discord.ui.Button["TicketControlsView"]):
                     "Only the requester or ticket staff can close this ticket.", ephemeral=True
                 )
                 return
-            await interaction.response.send_modal(TicketCloseModal(self.cog, record.ticket.id))
+            # Closing is intentionally one click.  The close reason is kept
+            # internally for audit/transcript records, but users are not
+            # forced through a reason modal.
+            await interaction.response.defer()
+            await self.cog.close_ticket(
+                interaction,
+                record.ticket.id,
+                f"Closed by {member.display_name}."[:1000],
+                record=record,
+            )
             return
         if not staff:
             await interaction.response.send_message(

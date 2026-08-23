@@ -83,7 +83,7 @@ def subcategory_config(
     }
     if children is not None:
         result["children"] = {
-            "prompt": str(children.get("prompt") or "")[:1000],
+            "prompt": (str(children.get("prompt") or "").strip() or "Choose an option.")[:1000],
             "options": deepcopy(children.get("options") or [])[:25],
         }
     return result
@@ -1049,23 +1049,23 @@ def _config_node(category: dict[str, Any], path: tuple[str, ...], *, create: boo
         if not isinstance(children, dict):
             if not create:
                 return None
-            children = {"prompt": "", "options": []}
+            children = {"prompt": "Choose an option.", "options": []}
             selected["children"] = children
-        children.setdefault("prompt", "")
+        children["prompt"] = str(children.get("prompt") or "").strip() or "Choose an option."
         children.setdefault("options", [])
         node = children
     return node
 
 
 def _model_node(category: TicketPanelCategory, path: tuple[str, ...]) -> tuple[str, list[dict[str, Any]]]:
-    prompt = category.subcategory_prompt or ""
+    prompt = str(category.subcategory_prompt or "").strip() or "Choose a reason for opening this ticket."
     options: list[dict[str, Any]] = category.subcategories
     for key in path:
         selected = next((item for item in options if item.get("key") == key), None)
         if selected is None or not isinstance(selected.get("children"), dict):
             return prompt, []
         children = selected["children"]
-        prompt = str(children.get("prompt") or "")
+        prompt = str(children.get("prompt") or "").strip() or "Choose an option."
         options = list(children.get("options") or [])
     return prompt, options
 
@@ -1077,7 +1077,7 @@ class PanelSubcategorySelect(discord.ui.Select[Any]):
         _, options = _model_node(manager.category, manager.path)
         select_options = [
             discord.SelectOption(
-                label=str(item.get("label", "Option"))[:100],
+                label=str(item.get("label") or "Emoji option")[:100],
                 value=str(item.get("key", "")),
                 description=(str(item.get("description")) if item.get("description") else None),
                 emoji=safe_component_emoji(
@@ -1167,7 +1167,10 @@ class PanelSubcategoryManagerButton(discord.ui.Button[Any]):
             )
             return
 
-        await interaction.response.defer(ephemeral=True, thinking=True)
+        # This action edits the existing manager message.  A thinking defer
+        # would leave Discord's loading state visible because no follow-up
+        # response is sent for a successful refresh.
+        await interaction.response.defer()
         current = await self.manager.editor.current_record()
         current_category = (
             next((item for item in current.categories if item.key == self.manager.category.key), None)
@@ -1194,7 +1197,7 @@ class PanelSubcategoryManagerButton(discord.ui.Button[Any]):
                 await interaction.followup.send("That option is no longer available.", ephemeral=True)
                 return
             selected_config.setdefault(
-                "children", {"prompt": "", "options": []}
+                "children", {"prompt": "Choose an option.", "options": []}
             )
         updated = await self.manager.editor.persist({}, categories)
         if updated is None:
@@ -1255,23 +1258,19 @@ class PanelSubcategoryManagerView(SafeView):
             response = str(item.get("response") or "No response configured")
             child_text = " · opens another question" if isinstance(item.get("children"), dict) else ""
             lines.append(
-                f"{f'{rendered} ' if rendered else ''}**{item.get('label', 'Option')}**"
+                f"{f'{rendered} ' if rendered else ''}**{item.get('label') or 'Emoji option'}**"
                 f" — {item.get('description') or 'No description'}{child_text}\n"
                 f"Response: {response[:180]}"
             )
         path_text = " → ".join(
-            next((str(item.get("label", key)) for item in self.category.subcategories if item.get("key") == key), key)
+            next((str(item.get("label") or "Emoji option") for item in self.category.subcategories if item.get("key") == key), key)
             for key in self.path
         )
         title = f"Question: {self.category.label}" + (f" → {path_text}" if path_text else "")
         embed = themed_embed(
             "ticket",
             title=title[:256],
-            description=(
-                f"Question message: {prompt}"
-                if prompt
-                else "Emoji-only options (leave the question message blank)."
-            ),
+            description=f"Question message: {prompt}",
             color=self.editor.record.panel.color,
             emoji=self.editor.record.panel.emoji,
         )
@@ -1382,10 +1381,9 @@ class PanelSubcategoryPromptModal(PanelEditorModal):
         self.manager = manager
         prompt, _ = _model_node(manager.category, manager.path)
         self.prompt_input = discord.ui.TextInput(
-            label="Question message (blank = emoji-only)",
+            label="Question message",
             style=discord.TextStyle.paragraph,
             default=prompt,
-            required=False,
             max_length=1000,
         )
         self.add_item(self.prompt_input)
@@ -1405,10 +1403,14 @@ class PanelSubcategoryPromptModal(PanelEditorModal):
         if node is None:
             await respond_ephemeral(interaction, "That question no longer exists. Reopen the editor.")
             return
+        prompt = self.prompt_input.value.strip()
+        if not prompt:
+            await respond_ephemeral(interaction, "A question message is required for every layer.")
+            return
         if self.manager.path:
-            node["prompt"] = self.prompt_input.value.strip()
+            node["prompt"] = prompt
         else:
-            categories[category_index]["subcategory_prompt"] = self.prompt_input.value.strip()
+            categories[category_index]["subcategory_prompt"] = prompt
         await self.manager.apply_tree_changes(interaction, categories)
 
 
@@ -1429,8 +1431,9 @@ class PanelSubcategoryModal(PanelEditorModal):
         self.existing = existing
         self.position = position
         self.label_input = discord.ui.TextInput(
-            label="Option label",
+            label="Option label (optional)",
             default=existing.get("label", "") if existing else "",
+            required=False,
             max_length=100,
         )
         self.description_input = discord.ui.TextInput(
@@ -1458,9 +1461,6 @@ class PanelSubcategoryModal(PanelEditorModal):
 
     async def on_submit(self, interaction: discord.Interaction) -> None:
         label = self.label_input.value.strip()
-        if not label:
-            await respond_ephemeral(interaction, "Option label cannot be empty.")
-            return
         current = await self.editor.current_record()
         current_category = (
             next((item for item in current.categories if item.key == self.manager.category.key), None)
@@ -1470,7 +1470,18 @@ class PanelSubcategoryModal(PanelEditorModal):
             await respond_ephemeral(interaction, "The ticket category changed while you were editing it.")
             return
         _, sibling_options = _model_node(current_category, self.manager.path)
-        key = category_key(label)
+        emoji = normalize_component_emoji(self.emoji_input.value, interaction.guild) or default_subcategory_emoji(self.position)
+        if self.existing is not None and not label:
+            key = str(self.existing.get("key") or f"option-{self.position + 1}")
+        elif label:
+            key = category_key(label)
+        else:
+            key = f"option-{self.position + 1}"
+            used_keys = {str(item.get("key")) for item in sibling_options}
+            suffix = 2
+            while key in used_keys:
+                key = f"option-{self.position + 1}-{suffix}"
+                suffix += 1
         if any(
             str(item.get("key")) == key
             and (self.existing is None or item.get("key") != self.existing.get("key"))
@@ -1478,7 +1489,6 @@ class PanelSubcategoryModal(PanelEditorModal):
         ):
             await respond_ephemeral(interaction, "That option key already exists at this question.")
             return
-        emoji = normalize_component_emoji(self.emoji_input.value, interaction.guild) or default_subcategory_emoji(self.position)
         if emoji and any(
             item.get("emoji") == emoji
             and (self.existing is None or item.get("key") != self.existing.get("key"))
@@ -1538,14 +1548,14 @@ class PanelCategoryModal(PanelEditorModal):
         self.description_input = discord.ui.TextInput(label="Category description", style=discord.TextStyle.paragraph, default=existing.description if existing and existing.description else "", required=False, max_length=100)
         self.emoji_input = discord.ui.TextInput(label="Category emoji (Unicode/server emoji)", default=existing.emoji if existing and existing.emoji else "", required=False, max_length=100)
         self.subcategory_prompt_input = discord.ui.TextInput(
-            label="Question message (blank = emoji-only)",
+            label="Question message",
             style=discord.TextStyle.paragraph,
             default=(
                 existing.subcategory_prompt
                 if existing and existing.subcategory_prompt
                 else "Choose a reason for opening this ticket."
             ),
-            required=False,
+            required=True,
             max_length=1000,
         )
         existing_question = ""
@@ -1570,6 +1580,10 @@ class PanelCategoryModal(PanelEditorModal):
         label = self.label_input.value.strip()
         if not label:
             await respond_ephemeral(interaction, "Category label cannot be empty.")
+            return
+        question_prompt = self.subcategory_prompt_input.value.strip()
+        if not question_prompt:
+            await respond_ephemeral(interaction, "A question message is required for every layer.")
             return
         target = interaction.guild.get_channel(self.target_category_id) if interaction.guild else None
         if not isinstance(target, discord.CategoryChannel):
@@ -1603,7 +1617,7 @@ class PanelCategoryModal(PanelEditorModal):
         normalized_emoji = normalize_component_emoji(self.emoji_input.value, interaction.guild)
         replacement = category_config(
             target_category_id=target.id,
-            subcategory_prompt=self.subcategory_prompt_input.value.strip(),
+            subcategory_prompt=question_prompt,
             subcategories=(self.existing.subcategories if self.existing else []),
             key=key,
             label=label,

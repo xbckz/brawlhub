@@ -149,11 +149,11 @@ def _panel(row: dict[str, Any]) -> TicketPanel:
 
 def _category(row: dict[str, Any]) -> TicketPanelCategory:
     def normalize_option(value: object) -> dict[str, Any] | None:
-        if not isinstance(value, dict) or not value.get("key") or not value.get("label"):
+        if not isinstance(value, dict) or not value.get("key"):
             return None
         option: dict[str, Any] = {
             "key": str(value["key"]),
-            "label": str(value["label"]),
+            "label": str(value.get("label") or ""),
             "description": str(value["description"]) if value.get("description") else None,
             "emoji": str(value["emoji"]) if value.get("emoji") else None,
             "response": str(value.get("response") or ""),
@@ -166,7 +166,7 @@ def _category(row: dict[str, Any]) -> TicketPanelCategory:
                 if (child := normalize_option(raw_child)) is not None
             ][:25]
             option["children"] = {
-                "prompt": str(children.get("prompt") or ""),
+                "prompt": str(children.get("prompt") or "").strip() or "Choose an option.",
                 "options": options,
             }
         return option
