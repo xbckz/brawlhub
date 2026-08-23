@@ -687,7 +687,9 @@ class TicketCategorySelect(discord.ui.Select["TicketCategoryView"]):
             category_id=selected.id,
             actor_id=interaction.user.id,
         )
+        moved = True
         if changed:
+            moved = await self.cog.move_ticket_to_target_category(record, selected)
             old_staff_role_ids = set(
                 record.category.staff_role_ids or record.panel.staff_role_ids
             )
@@ -704,7 +706,14 @@ class TicketCategorySelect(discord.ui.Select["TicketCategoryView"]):
             )
         await interaction.edit_original_response(
             content=(
-                f"Ticket category changed to **{selected.label}**."
+                (
+                    f"Ticket category changed to **{selected.label}**."
+                    if moved
+                    else (
+                        f"Ticket category changed to **{selected.label}**, but the ticket channel "
+                        "could not be moved to its configured Discord category."
+                    )
+                )
                 if changed
                 else "The ticket category could not be changed because the ticket is no longer available."
             ),
@@ -1263,6 +1272,46 @@ class TicketsCog(commands.Cog):
                     exc_info=True,
                 )
 
+    async def move_ticket_to_target_category(
+        self,
+        record: TicketRecord,
+        category: TicketPanelCategory,
+    ) -> bool:
+        if not record.ticket.channel_id:
+            return False
+        channel = self.bot.get_channel(int(record.ticket.channel_id))
+        if channel is None:
+            try:
+                channel = await self.bot.fetch_channel(int(record.ticket.channel_id))
+            except discord.HTTPException:
+                return False
+        if not isinstance(channel, discord.TextChannel):
+            return False
+        target_id = int(category.target_category_id or record.panel.open_category_id)
+        target = channel.guild.get_channel(target_id)
+        if not isinstance(target, discord.CategoryChannel):
+            logger.warning(
+                "Configured target category %s is unavailable for ticket %s",
+                target_id,
+                record.ticket.id,
+            )
+            return False
+        if channel.category_id == target.id:
+            return True
+        try:
+            await channel.edit(
+                category=target,
+                reason=f"Route ticket to {category.label} category",
+            )
+        except (discord.Forbidden, discord.HTTPException):
+            logger.warning(
+                "Could not move ticket %s to Discord category %s",
+                record.ticket.id,
+                target.id,
+                exc_info=True,
+            )
+            return False
+        return True
     async def add_staff_to_thread(
         self,
         thread: discord.Thread,
@@ -1711,7 +1760,7 @@ class TicketsCog(commands.Cog):
             return
         ordered_ids = await self.repository.active_channel_order(
             guild_id=channel.guild.id,
-            open_category_id=channel.category_id,
+            target_category_id=channel.category_id,
         )
         available_channels = {
             str(candidate.id): candidate
@@ -1836,7 +1885,10 @@ class TicketsCog(commands.Cog):
         channel: discord.TextChannel | None = None
         creation_committed = False
         try:
-            open_category = interaction.guild.get_channel(int(panel.open_category_id))
+            target_category_id = int(
+                category.target_category_id or panel.open_category_id
+            )
+            open_category = interaction.guild.get_channel(target_category_id)
             bot_member = interaction.guild.me
             if not isinstance(open_category, discord.CategoryChannel) or bot_member is None:
                 raise ValueError("ticket_category_unavailable")
@@ -2136,6 +2188,7 @@ class TicketsCog(commands.Cog):
                 overwrite = ticket_channel.overwrites_for(requester)
                 overwrite.update(view_channel=True, send_messages=True)
                 await ticket_channel.set_permissions(requester, overwrite=overwrite)
+            await self.move_ticket_to_target_category(record, record.category)
         await self.refresh_ticket_state(record.ticket.id)
         return "Ticket reopened."
 

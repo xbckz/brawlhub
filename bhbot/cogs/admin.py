@@ -53,6 +53,7 @@ def category_key(value: str) -> str:
 
 def category_config(
     *,
+    target_category_id: int | None,
     key: str,
     label: str,
     description: str | None,
@@ -61,6 +62,7 @@ def category_config(
     form_fields: list[dict[str, Any]] | None = None,
 ) -> TicketCategoryConfig:
     return {
+        "target_category_id": target_category_id,
         "key": category_key(key),
         "label": label[:100],
         "description": description[:100] if description else None,
@@ -98,6 +100,9 @@ def panel_values(panel: Any) -> dict[str, Any]:
 def category_configs(categories: list[TicketPanelCategory]) -> list[TicketCategoryConfig]:
     return [
         category_config(
+            target_category_id=(
+                int(item.target_category_id) if item.target_category_id else None
+            ),
             key=item.key,
             label=item.label,
             description=item.description,
@@ -332,7 +337,11 @@ class PanelEditorView(SafeView):
         embed.add_field(
             name=f"Categories ({len(self.record.categories)}/25)",
             value="\n".join(
-                f"{item.emoji or '•'} **{item.label}** — {item.description or 'No description'}"
+                (
+                    f"{item.emoji or '•'} **{item.label}** — {item.description or 'No description'}\n"
+                    f"Target: <#{item.target_category_id or panel.open_category_id}> · "
+                    f"Ping: {', '.join(f'<@&{role_id}>' for role_id in (item.staff_role_ids or panel.staff_role_ids))}"
+                )
                 for item in self.record.categories[:25]
             )[:1024]
             or "No categories configured.",
@@ -535,7 +544,11 @@ class PanelEditorView(SafeView):
         elif action == "routes":
             await interaction.response.send_modal(PanelRoutesModal(self, message))
         elif action == "add-category":
-            await interaction.response.send_modal(PanelCategoryModal(self, message))
+            await interaction.response.send_message(
+                "Choose the Discord category where this ticket type will be created and the roles to ping.",
+                view=PanelCategoryRoutingView(self, message),
+                ephemeral=True,
+            )
         elif action == "edit-category":
             selected = next(
                 (item for item in self.record.categories if item.id == self.selected_category_id),
@@ -544,7 +557,11 @@ class PanelEditorView(SafeView):
             if selected is None:
                 await respond_ephemeral(interaction, "Select a category first.")
                 return
-            await interaction.response.send_modal(PanelCategoryModal(self, message, selected))
+            await interaction.response.send_message(
+                "Choose the Discord category where this ticket type will be created and the roles to ping.",
+                view=PanelCategoryRoutingView(self, message, selected),
+                ephemeral=True,
+            )
         elif action == "remove-category":
             selected = next(
                 (item for item in self.record.categories if item.id == self.selected_category_id),
@@ -739,12 +756,12 @@ class PanelLimitsModal(PanelEditorModal):
 
 class PanelRoutesModal(PanelEditorModal):
     def __init__(self, editor: PanelEditorView, message: discord.Message) -> None:
-        super().__init__(editor, message, title="Edit panel locations and staff")
+        super().__init__(editor, message, title="Edit panel fallback locations and staff")
         panel = editor.record.panel
         self.panel_channel_input = discord.ui.TextInput(label="Panel channel ID", default=panel.panel_channel_id, max_length=20)
-        self.open_category_input = discord.ui.TextInput(label="Open category ID", default=panel.open_category_id, max_length=20)
+        self.open_category_input = discord.ui.TextInput(label="Fallback category ID", default=panel.open_category_id, max_length=20)
         self.archive_category_input = discord.ui.TextInput(label="Archive category ID (blank = none)", default=panel.archive_category_id or "", required=False, max_length=20)
-        self.staff_roles_input = discord.ui.TextInput(label="Staff role IDs (comma-separated)", default=", ".join(panel.staff_role_ids), max_length=1000)
+        self.staff_roles_input = discord.ui.TextInput(label="Fallback staff role IDs (comma-separated)", default=", ".join(panel.staff_role_ids), max_length=1000)
         for item in (self.panel_channel_input, self.open_category_input, self.archive_category_input, self.staff_roles_input):
             self.add_item(item)
 
@@ -777,7 +794,7 @@ class PanelRoutesModal(PanelEditorModal):
             await respond_ephemeral(interaction, "Panel channel must be a text channel in this server.")
             return
         if not isinstance(open_category, discord.CategoryChannel):
-            await respond_ephemeral(interaction, "Open category must be a category channel in this server.")
+            await respond_ephemeral(interaction, "Fallback category must be a category channel in this server.")
             return
         if archive_category_id and not isinstance(archive_category, discord.CategoryChannel):
             await respond_ephemeral(interaction, "Archive category must be a category channel in this server.")
@@ -796,14 +813,121 @@ class PanelRoutesModal(PanelEditorModal):
         )
 
 
+class PanelCategoryRoutingContinueButton(discord.ui.Button[Any]):
+    def __init__(self, routing: "PanelCategoryRoutingView") -> None:
+        super().__init__(
+            label="Continue",
+            style=discord.ButtonStyle.success,
+            row=2,
+            custom_id=f"ticket-category-routing-continue:{routing.editor.panel_id}",
+        )
+        self.routing = routing
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        if interaction.guild is None:
+            await respond_ephemeral(interaction, "This control can only be used in a server.")
+            return
+        if not self.routing.target_category.values:
+            await respond_ephemeral(interaction, "Select the Discord target category first.")
+            return
+        if not self.routing.ping_roles.values:
+            await respond_ephemeral(interaction, "Select at least one role to ping for this ticket category.")
+            return
+        target_id = int(getattr(self.routing.target_category.values[0], "id", 0))
+        target = interaction.guild.get_channel(target_id)
+        if not isinstance(target, discord.CategoryChannel):
+            await respond_ephemeral(interaction, "The selected target must be a category channel in this server.")
+            return
+        role_ids = [int(getattr(role, "id", 0)) for role in self.routing.ping_roles.values]
+        if any(interaction.guild.get_role(role_id) is None for role_id in role_ids):
+            await respond_ephemeral(interaction, "Every selected ping role must belong to this server.")
+            return
+        await interaction.response.send_modal(
+            PanelCategoryModal(
+                self.routing.editor,
+                self.routing.message,
+                self.routing.existing,
+                target_category_id=target.id,
+                staff_role_ids=role_ids,
+            )
+        )
+
+
+class PanelCategoryRoutingView(SafeView):
+    def __init__(
+        self,
+        editor: PanelEditorView,
+        message: discord.Message,
+        existing: TicketPanelCategory | None = None,
+    ) -> None:
+        super().__init__(timeout=600)
+        self.editor = editor
+        self.message = message
+        self.existing = existing
+        default_target_id = (
+            existing.target_category_id
+            if existing and existing.target_category_id
+            else editor.record.panel.open_category_id
+        )
+        default_role_ids = (
+            existing.staff_role_ids
+            if existing and existing.staff_role_ids
+            else editor.record.panel.staff_role_ids
+        )
+        guild = editor.cog.bot.get_guild(int(editor.record.panel.guild_id))
+        default_target = []
+        if (
+            guild is not None
+            and default_target_id.isdigit()
+            and isinstance(guild.get_channel(int(default_target_id)), discord.CategoryChannel)
+        ):
+            default_target = [discord.Object(id=int(default_target_id))]
+        default_roles = [
+            discord.Object(id=int(role_id))
+            for role_id in default_role_ids[:25]
+            if guild is not None
+            and str(role_id).isdigit()
+            and guild.get_role(int(role_id)) is not None
+        ]
+        self.target_category = PanelCreateChannelSelect(
+            channel_types=[discord.ChannelType.category],
+            placeholder="Select the target Discord category",
+            min_values=1,
+            max_values=1,
+            row=0,
+            custom_id=f"ticket-category-routing-target:{editor.panel_id}",
+            default_values=default_target,
+        )
+        self.ping_roles = PanelCreateRoleSelect(
+            placeholder="Select roles to ping for this category",
+            min_values=1,
+            max_values=25,
+            row=1,
+            custom_id=f"ticket-category-routing-roles:{editor.panel_id}",
+            default_values=default_roles,
+        )
+        self.add_item(self.target_category)
+        self.add_item(self.ping_roles)
+        self.add_item(PanelCategoryRoutingContinueButton(self))
+
+
 class PanelCategoryModal(PanelEditorModal):
-    def __init__(self, editor: PanelEditorView, message: discord.Message, existing: TicketPanelCategory | None = None) -> None:
+    def __init__(
+        self,
+        editor: PanelEditorView,
+        message: discord.Message,
+        existing: TicketPanelCategory | None = None,
+        *,
+        target_category_id: int,
+        staff_role_ids: list[int],
+    ) -> None:
         super().__init__(editor, message, title="Edit ticket category" if existing else "Add ticket category")
         self.existing = existing
+        self.target_category_id = target_category_id
+        self.staff_role_ids = staff_role_ids
         self.label_input = discord.ui.TextInput(label="Category label", default=existing.label if existing else "", max_length=100)
         self.description_input = discord.ui.TextInput(label="Category description", style=discord.TextStyle.paragraph, default=existing.description if existing and existing.description else "", required=False, max_length=100)
         self.emoji_input = discord.ui.TextInput(label="Category emoji (Unicode/server emoji)", default=existing.emoji if existing and existing.emoji else "", required=False, max_length=100)
-        self.roles_input = discord.ui.TextInput(label="Staff role IDs (comma-separated)", default=", ".join(existing.staff_role_ids) if existing else ", ".join(editor.record.panel.staff_role_ids), required=False, max_length=1000)
         existing_question = ""
         if existing and existing.form_fields:
             existing_question = str(existing.form_fields[0].get("label", ""))
@@ -813,7 +937,7 @@ class PanelCategoryModal(PanelEditorModal):
             required=False,
             max_length=45,
         )
-        for item in (self.label_input, self.description_input, self.emoji_input, self.roles_input, self.question_input):
+        for item in (self.label_input, self.description_input, self.emoji_input, self.question_input):
             self.add_item(item)
 
     async def on_submit(self, interaction: discord.Interaction) -> None:
@@ -821,10 +945,13 @@ class PanelCategoryModal(PanelEditorModal):
         if not label:
             await respond_ephemeral(interaction, "Category label cannot be empty.")
             return
-        try:
-            roles = parse_role_ids(self.roles_input.value) or [int(value) for value in self.editor.record.panel.staff_role_ids]
-        except ValueError as error:
-            await respond_ephemeral(interaction, str(error))
+        target = interaction.guild.get_channel(self.target_category_id) if interaction.guild else None
+        if not isinstance(target, discord.CategoryChannel):
+            await respond_ephemeral(interaction, "The selected target Discord category is no longer available.")
+            return
+        roles = self.staff_role_ids
+        if not roles or any(interaction.guild.get_role(role_id) is None for role_id in roles):
+            await respond_ephemeral(interaction, "Select valid ping roles for this ticket category.")
             return
         question = self.question_input.value.strip()[:45]
         form_fields = [
@@ -849,6 +976,7 @@ class PanelCategoryModal(PanelEditorModal):
         categories = category_configs(current.categories)
         normalized_emoji = normalize_component_emoji(self.emoji_input.value, interaction.guild)
         replacement = category_config(
+            target_category_id=target.id,
             key=key,
             label=label,
             description=self.description_input.value.strip() or None,
@@ -951,7 +1079,7 @@ class PanelCreateSetupView(SafeView):
         )
         self.open_category = PanelCreateChannelSelect(
             channel_types=[discord.ChannelType.category],
-            placeholder="Select the ticket category",
+            placeholder="Select the fallback ticket category",
             min_values=1,
             max_values=1,
             row=1,
@@ -982,7 +1110,7 @@ class PanelCreateSetupView(SafeView):
         if not self.panel_channel.values or not self.open_category.values or not self.staff_role.values:
             await respond_ephemeral(
                 interaction,
-                "Select the panel channel, ticket category, and staff role first.",
+                "Select the panel channel, fallback category, and staff role first.",
             )
             return
         await interaction.response.send_modal(PanelCreateDetailsModal(self))

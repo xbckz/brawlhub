@@ -28,6 +28,7 @@ class TicketFormFieldConfig(TypedDict):
 
 
 class TicketCategoryConfig(TypedDict):
+    target_category_id: int | None
     key: str
     label: str
     description: str | None
@@ -145,6 +146,9 @@ def _category(row: dict[str, Any]) -> TicketPanelCategory:
     return TicketPanelCategory(
         id=_uuid(row["id"]),
         panel_id=_uuid(row["panel_id"]),
+        target_category_id=(
+            str(row["target_category_id"]) if row.get("target_category_id") else None
+        ),
         key=str(row["key"]),
         label=str(row["label"]),
         description=str(row["description"]) if row["description"] is not None else None,
@@ -226,6 +230,7 @@ SELECT t.*,
     p.status AS panel_status, p.message_id AS panel_message_id, p.error_code AS panel_error_code,
     p.revision AS panel_revision, p.created_at AS panel_created_at, p.updated_at AS panel_updated_at,
     c.id AS category_record_id, c.panel_id AS category_panel_id,
+    c.target_category_id AS category_target_category_id,
     c.key AS category_key, c.label AS category_label, c.description AS category_description,
     c.emoji AS category_emoji, c.staff_role_ids AS category_staff_role_ids,
     c.form_fields AS category_form_fields, c.position AS category_position, c.active AS category_active
@@ -333,6 +338,7 @@ class TicketRepository:
             (
                 str(category_id := uuid.uuid4()),
                 str(panel_id),
+                str(category["target_category_id"]) if category["target_category_id"] else None,
                 category["key"],
                 category["label"],
                 category["description"],
@@ -401,8 +407,8 @@ class TicketRepository:
             connection.executemany(
                 """
                 INSERT INTO ticket_panel_categories
-                (id, panel_id, key, label, description, emoji, staff_role_ids, form_fields, position, active)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                (id, panel_id, target_category_id, key, label, description, emoji, staff_role_ids, form_fields, position, active)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 category_rows,
             )
@@ -475,8 +481,8 @@ class TicketRepository:
             connection.executemany(
                 """
                 INSERT INTO ticket_panel_categories
-                (id, panel_id, key, label, description, emoji, staff_role_ids, form_fields, position, active)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                (id, panel_id, target_category_id, key, label, description, emoji, staff_role_ids, form_fields, position, active)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 category_rows,
             )
@@ -805,15 +811,18 @@ class TicketRepository:
 
         return await self.database.transaction(change)
 
-    async def active_channel_order(self, *, guild_id: int, open_category_id: int) -> list[str]:
+    async def active_channel_order(self, *, guild_id: int, target_category_id: int) -> list[str]:
         rows = await self.database.query(
             """
             SELECT t.channel_id, t.priority, t.created_at FROM tickets t
             JOIN ticket_panels p ON p.id=t.panel_id
-            WHERE t.guild_id=? AND p.open_category_id=? AND t.channel_id IS NOT NULL
+            JOIN ticket_panel_categories c ON c.id=t.category_id
+            WHERE t.guild_id=?
+            AND COALESCE(c.target_category_id, p.open_category_id)=?
+            AND t.channel_id IS NOT NULL
             AND t.status IN ('open','claimed')
             """,
-            (str(guild_id), str(open_category_id)),
+            (str(guild_id), str(target_category_id)),
         )
         rank = {"urgent": 0, "high": 1, "normal": 2, "low": 3}
         rows.sort(key=lambda row: (rank.get(str(row["priority"]), 2), str(row["created_at"]), str(row["channel_id"])))
@@ -1028,7 +1037,8 @@ def _record_from_joined_row(row: dict[str, Any]) -> TicketRecord:
         "created_at": row["panel_created_at"], "updated_at": row["panel_updated_at"],
     }
     category_row = {
-        "id": row["category_record_id"], "panel_id": row["category_panel_id"], "key": row["category_key"],
+        "id": row["category_record_id"], "panel_id": row["category_panel_id"],
+        "target_category_id": row["category_target_category_id"], "key": row["category_key"],
         "label": row["category_label"], "description": row["category_description"],
         "emoji": row["category_emoji"], "staff_role_ids": row["category_staff_role_ids"],
         "form_fields": row["category_form_fields"], "position": row["category_position"],

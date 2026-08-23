@@ -73,6 +73,7 @@ class TicketPanel:
 class TicketPanelCategory:
     id: uuid.UUID
     panel_id: uuid.UUID
+    target_category_id: str | None
     key: str
     label: str
     description: str | None

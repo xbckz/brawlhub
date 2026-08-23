@@ -96,6 +96,7 @@ SCHEMA_STATEMENTS: tuple[str, ...] = (
     CREATE TABLE IF NOT EXISTS ticket_panel_categories (
         id TEXT PRIMARY KEY,
         panel_id TEXT NOT NULL,
+        target_category_id TEXT,
         key TEXT NOT NULL,
         label TEXT NOT NULL,
         description TEXT,
@@ -239,6 +240,16 @@ class Database:
             if "opening_message" not in columns:
                 connection.execute(
                     "ALTER TABLE ticket_panels ADD COLUMN opening_message TEXT NOT NULL DEFAULT ''"
+                )
+            category_columns = {
+                str(row[1])
+                for row in connection.execute(
+                    "PRAGMA table_info(ticket_panel_categories)"
+                ).fetchall()
+            }
+            if "target_category_id" not in category_columns:
+                connection.execute(
+                    "ALTER TABLE ticket_panel_categories ADD COLUMN target_category_id TEXT"
                 )
             ticket_columns = {
                 str(row[1])
