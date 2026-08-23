@@ -900,11 +900,21 @@ class PanelCreateContinueButton(discord.ui.Button[Any]):
         await self.setup.continue_to_details(interaction)
 
 
+class PanelCreateChannelSelect(discord.ui.ChannelSelect[Any]):
+    async def callback(self, interaction: discord.Interaction) -> None:
+        await interaction.response.defer()
+
+
+class PanelCreateRoleSelect(discord.ui.RoleSelect[Any]):
+    async def callback(self, interaction: discord.Interaction) -> None:
+        await interaction.response.defer()
+
+
 class PanelCreateSetupView(SafeView):
     def __init__(self, cog: "TicketAdminCog") -> None:
         super().__init__(timeout=600)
         self.cog = cog
-        self.panel_channel = discord.ui.ChannelSelect(
+        self.panel_channel = PanelCreateChannelSelect(
             channel_types=[discord.ChannelType.text],
             placeholder="Select the panel channel",
             min_values=1,
@@ -912,7 +922,7 @@ class PanelCreateSetupView(SafeView):
             row=0,
             custom_id="ticket-panel-create-channel",
         )
-        self.open_category = discord.ui.ChannelSelect(
+        self.open_category = PanelCreateChannelSelect(
             channel_types=[discord.ChannelType.category],
             placeholder="Select the ticket category",
             min_values=1,
@@ -920,7 +930,7 @@ class PanelCreateSetupView(SafeView):
             row=1,
             custom_id="ticket-panel-create-open-category",
         )
-        self.archive_category = discord.ui.ChannelSelect(
+        self.archive_category = PanelCreateChannelSelect(
             channel_types=[discord.ChannelType.category],
             placeholder="Select an archive category (optional)",
             min_values=0,
@@ -928,7 +938,7 @@ class PanelCreateSetupView(SafeView):
             row=2,
             custom_id="ticket-panel-create-archive-category",
         )
-        self.staff_role = discord.ui.RoleSelect(
+        self.staff_role = PanelCreateRoleSelect(
             placeholder="Select the staff role",
             min_values=1,
             max_values=1,
