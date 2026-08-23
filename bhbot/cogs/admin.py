@@ -1385,6 +1385,7 @@ class PanelSubcategoryPromptModal(PanelEditorModal):
             label="Question message (blank = emoji-only)",
             style=discord.TextStyle.paragraph,
             default=prompt,
+            required=False,
             max_length=1000,
         )
         self.add_item(self.prompt_input)
