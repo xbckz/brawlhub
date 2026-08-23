@@ -172,13 +172,16 @@ class PanelEditorButton(discord.ui.Button[Any]):
 class PanelCategorySelect(discord.ui.Select[Any]):
     def __init__(self, editor: "PanelEditorView") -> None:
         self.editor = editor
+        options = self.options_for(editor.record)
+        if not options:
+            options = [discord.SelectOption(label="No categories", value="__none__")]
         super().__init__(
             placeholder="Select a category to edit or remove",
             min_values=1,
             max_values=1,
             row=3,
             custom_id=f"ticket-editor-category:{editor.panel_id}",
-            options=self.options_for(editor.record),
+            options=options,
             disabled=not editor.record.categories,
         )
 
@@ -837,20 +840,23 @@ class PanelCategoryModal(PanelEditorModal):
 class PanelManagerSelect(discord.ui.Select[Any]):
     def __init__(self, manager: "PanelManagerView") -> None:
         self.manager = manager
+        options = [
+            discord.SelectOption(
+                label=record.panel.title[:100],
+                value=str(record.panel.id),
+                description=f"{record.panel.status} • {len(record.categories)} categories"[:100],
+            )
+            for record in manager.records[:25]
+        ]
+        if not options:
+            options = [discord.SelectOption(label="No panels", value="__none__")]
         super().__init__(
             placeholder="Select a ticket panel",
             min_values=1,
             max_values=1,
             row=0,
             custom_id="ticket-panel-manager-select",
-            options=[
-                discord.SelectOption(
-                    label=record.panel.title[:100],
-                    value=str(record.panel.id),
-                    description=f"{record.panel.status} • {len(record.categories)} categories"[:100],
-                )
-                for record in manager.records[:25]
-            ],
+            options=options,
             disabled=not manager.records,
         )
 

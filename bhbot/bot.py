@@ -26,7 +26,12 @@ class TicketCommandTree(app_commands.CommandTree):
         logger.exception(
             "Application command failed",
             exc_info=error,
-            extra={"context": {"interaction_id": interaction.id, "command": interaction.command}},
+            extra={
+                "context": {
+                    "interaction_id": interaction.id,
+                    "command": interaction.command.qualified_name if interaction.command else None,
+                }
+            },
         )
         if isinstance(original, app_commands.CheckFailure) and str(original):
             message = str(original)
