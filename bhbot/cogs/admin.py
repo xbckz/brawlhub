@@ -1295,9 +1295,10 @@ class PanelSubcategoryManagerView(SafeView):
         if updated_category is None:
             return None
         target_path = self.path if path is None else path
-        editor_refreshed = await self.editor.refresh_message(self.editor_message)
-        if not editor_refreshed:
-            await self.editor.send_fresh_editor(interaction, updated)
+        # Refresh the original full panel editor when it is still available.
+        # Do not open a second full editor here: navigating or editing a
+        # question should keep the user inside this question manager.
+        await self.editor.refresh_message(self.editor_message)
         replacement = PanelSubcategoryManagerView(
             self.editor,
             self.editor.message or self.editor_message,
