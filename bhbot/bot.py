@@ -13,7 +13,7 @@ from bhbot.db.engine import Database
 from bhbot.db.guild_repository import GuildRepository
 from bhbot.db.ticket_admin_repository import TicketAdminRepository
 from bhbot.logging import configure_logging
-from bhbot.ui import INTERACTION_EXPIRED_MESSAGE, respond_ephemeral
+from bhbot.ui import respond_ephemeral
 
 logger = logging.getLogger(__name__)
 
@@ -67,7 +67,6 @@ class TicketBot(commands.Bot):
         self.database = database
         self.guild_repository = GuildRepository(database)
         self.ticket_admin_repository = TicketAdminRepository(database)
-        self._interaction_watchdogs: set[asyncio.Task[None]] = set()
         self._closing = False
 
     async def is_selected_admin(self, member: discord.Member) -> bool:
@@ -80,21 +79,6 @@ class TicketBot(commands.Bot):
         return await self.ticket_admin_repository.is_admin(
             guild_id=member.guild.id, user_id=member.id
         )
-
-    async def _expire_unhandled_interaction(self, interaction: discord.Interaction) -> None:
-        await asyncio.sleep(2.25)
-        if not interaction.response.is_done():
-            await respond_ephemeral(interaction, INTERACTION_EXPIRED_MESSAGE)
-
-    async def on_interaction(self, interaction: discord.Interaction) -> None:
-        if interaction.type not in {
-            discord.InteractionType.component,
-            discord.InteractionType.modal_submit,
-        }:
-            return
-        task = asyncio.create_task(self._expire_unhandled_interaction(interaction))
-        self._interaction_watchdogs.add(task)
-        task.add_done_callback(self._interaction_watchdogs.discard)
 
     async def setup_hook(self) -> None:
         if not await self.database.ping():
