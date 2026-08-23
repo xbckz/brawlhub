@@ -166,7 +166,7 @@ def _category(row: dict[str, Any]) -> TicketPanelCategory:
                 if (child := normalize_option(raw_child)) is not None
             ][:25]
             option["children"] = {
-                "prompt": str(children.get("prompt") or "Choose an option."),
+                "prompt": str(children.get("prompt") or ""),
                 "options": options,
             }
         return option

@@ -83,7 +83,7 @@ def subcategory_config(
     }
     if children is not None:
         result["children"] = {
-            "prompt": str(children.get("prompt") or "Choose an option.")[:1000],
+            "prompt": str(children.get("prompt") or "")[:1000],
             "options": deepcopy(children.get("options") or [])[:25],
         }
     return result
@@ -1049,23 +1049,23 @@ def _config_node(category: dict[str, Any], path: tuple[str, ...], *, create: boo
         if not isinstance(children, dict):
             if not create:
                 return None
-            children = {"prompt": "Choose an option.", "options": []}
+            children = {"prompt": "", "options": []}
             selected["children"] = children
-        children.setdefault("prompt", "Choose an option.")
+        children.setdefault("prompt", "")
         children.setdefault("options", [])
         node = children
     return node
 
 
 def _model_node(category: TicketPanelCategory, path: tuple[str, ...]) -> tuple[str, list[dict[str, Any]]]:
-    prompt = category.subcategory_prompt or "Choose a reason for opening this ticket."
+    prompt = category.subcategory_prompt or ""
     options: list[dict[str, Any]] = category.subcategories
     for key in path:
         selected = next((item for item in options if item.get("key") == key), None)
         if selected is None or not isinstance(selected.get("children"), dict):
             return prompt, []
         children = selected["children"]
-        prompt = str(children.get("prompt") or "Choose an option.")
+        prompt = str(children.get("prompt") or "")
         options = list(children.get("options") or [])
     return prompt, options
 
@@ -1194,7 +1194,7 @@ class PanelSubcategoryManagerButton(discord.ui.Button[Any]):
                 await interaction.followup.send("That option is no longer available.", ephemeral=True)
                 return
             selected_config.setdefault(
-                "children", {"prompt": "Choose an option.", "options": []}
+                "children", {"prompt": "", "options": []}
             )
         updated = await self.manager.editor.persist({}, categories)
         if updated is None:
@@ -1267,7 +1267,11 @@ class PanelSubcategoryManagerView(SafeView):
         embed = themed_embed(
             "ticket",
             title=title[:256],
-            description=f"Normal message question: {prompt}",
+            description=(
+                f"Question message: {prompt}"
+                if prompt
+                else "Emoji-only options (leave the question message blank)."
+            ),
             color=self.editor.record.panel.color,
             emoji=self.editor.record.panel.emoji,
         )
@@ -1378,7 +1382,7 @@ class PanelSubcategoryPromptModal(PanelEditorModal):
         self.manager = manager
         prompt, _ = _model_node(manager.category, manager.path)
         self.prompt_input = discord.ui.TextInput(
-            label="Normal message shown in the ticket",
+            label="Question message (blank = emoji-only)",
             style=discord.TextStyle.paragraph,
             default=prompt,
             max_length=1000,
@@ -1401,7 +1405,7 @@ class PanelSubcategoryPromptModal(PanelEditorModal):
             await respond_ephemeral(interaction, "That question no longer exists. Reopen the editor.")
             return
         if self.manager.path:
-            node["prompt"] = self.prompt_input.value.strip() or "Choose an option."
+            node["prompt"] = self.prompt_input.value.strip()
         else:
             categories[category_index]["subcategory_prompt"] = self.prompt_input.value.strip()
         await self.manager.apply_tree_changes(interaction, categories)
@@ -1533,7 +1537,7 @@ class PanelCategoryModal(PanelEditorModal):
         self.description_input = discord.ui.TextInput(label="Category description", style=discord.TextStyle.paragraph, default=existing.description if existing and existing.description else "", required=False, max_length=100)
         self.emoji_input = discord.ui.TextInput(label="Category emoji (Unicode/server emoji)", default=existing.emoji if existing and existing.emoji else "", required=False, max_length=100)
         self.subcategory_prompt_input = discord.ui.TextInput(
-            label="First question message",
+            label="Question message (blank = emoji-only)",
             style=discord.TextStyle.paragraph,
             default=(
                 existing.subcategory_prompt

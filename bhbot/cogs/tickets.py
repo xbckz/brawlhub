@@ -305,7 +305,7 @@ class TicketSubcategoryView(SafeView):
 
 def ticket_flow_node(category: TicketPanelCategory) -> dict[str, Any]:
     return {
-        "prompt": category.subcategory_prompt or "Choose a reason for opening this ticket.",
+        "prompt": category.subcategory_prompt,
         "options": category.subcategories[:25],
     }
 
@@ -314,14 +314,17 @@ def ticket_flow_question_content(
     node: dict[str, Any], guild: discord.Guild | None = None
 ) -> str:
     """Render a question like a reaction menu, while keeping button controls."""
-    lines = [str(node.get("prompt") or "Choose an option.").strip()]
+    lines: list[str] = []
+    prompt = str(node.get("prompt") or "").strip()
+    if prompt:
+        lines.append(prompt)
     for position, option in enumerate(node.get("options", [])[:25]):
         if not isinstance(option, dict):
             continue
         fallback = default_subcategory_emoji(position) or "•"
         rendered = safe_component_emoji(option.get("emoji") or fallback, guild=guild)
         lines.append(f"{rendered or fallback} {str(option.get('label') or 'Option')[:100]}")
-    return "\n".join(lines)[:2000]
+    return "\n".join(lines)[:2000] or "\u200b"
 
 
 class TicketFlowOptionButton(discord.ui.Button["TicketFlowView"]):
@@ -355,11 +358,10 @@ class TicketFlowOptionButton(discord.ui.Button["TicketFlowView"]):
         ):
             await respond_ephemeral(interaction, "Only the requester or ticket staff can use this question.")
             return
-        try:
-            await interaction.response.edit_message(view=None)
-        except discord.HTTPException:
-            if not interaction.response.is_done():
-                await interaction.response.defer()
+        # Keep the emoji controls visible after a selection, like a reaction
+        # menu. The same question can therefore be revisited without losing
+        # its options from the message.
+        await interaction.response.defer()
         channel = interaction.channel
         if not isinstance(channel, discord.TextChannel):
             await respond_ephemeral(interaction, "This ticket channel is no longer available.")
@@ -379,7 +381,7 @@ class TicketFlowOptionButton(discord.ui.Button["TicketFlowView"]):
         await self.flow_view.cog.send_ticket_flow_message(
             channel,
             record,
-            {"prompt": str(children.get("prompt") or "Choose an option."), "options": options},
+            {"prompt": str(children.get("prompt") or ""), "options": options},
         )
 
 
@@ -1412,7 +1414,7 @@ class TicketsCog(commands.Cog):
         record: TicketPanelRecord,
         category: TicketPanelCategory,
     ) -> discord.Embed:
-        prompt = category.subcategory_prompt or "Choose a reason for opening this ticket."
+        prompt = category.subcategory_prompt
         guild = self.bot.get_guild(int(record.panel.guild_id))
         lines = []
         for index, item in enumerate(category.subcategories[:25]):
