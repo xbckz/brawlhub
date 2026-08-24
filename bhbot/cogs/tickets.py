@@ -919,6 +919,7 @@ class TicketCategorySelect(discord.ui.Select["TicketCategoryView"]):
             )
             await self.cog.refresh_ticket_state(
                 record.ticket.id,
+                reping_staff_roles=True,
             )
         await interaction.edit_original_response(
             content=(
@@ -1611,6 +1612,7 @@ class TicketsCog(commands.Cog):
         ticket_id: uuid.UUID,
         *,
         sync_channel_layout: bool = True,
+        reping_staff_roles: bool = False,
     ) -> None:
         record = await self.repository.get_ticket(ticket_id)
         if record is None or not record.ticket.channel_id:
@@ -1646,11 +1648,47 @@ class TicketsCog(commands.Cog):
                     staff_message = await staff_channel.fetch_message(
                         int(record.ticket.staff_control_message_id)
                     )
+                    bot_member = staff_channel.guild.me
+                    can_mention_nonmentionable = bool(
+                        bot_member
+                        and (
+                            bot_member.guild_permissions.administrator
+                            or bot_member.guild_permissions.mention_everyone
+                        )
+                    )
+                    staff_role_ids = (
+                        record.category.staff_role_ids or record.panel.staff_role_ids
+                    )
+                    notified_roles = [
+                        role
+                        for role_id in staff_role_ids
+                        if (role := staff_channel.guild.get_role(int(role_id))) is not None
+                        and (role.mentionable or can_mention_nonmentionable)
+                    ]
+                    role_mentions = " ".join(
+                        role.mention for role in notified_roles
+                    )
                     await staff_message.edit(
+                        content=role_mentions or None,
                         embed=await self.ticket_state_embed(record, include_notes=True),
                         view=await self.ticket_controls_view(ticket_id),
+                        # Replace the old role text without pinging during the
+                        # edit; the explicit notification below performs one
+                        # deliberate ping for the newly selected category.
                         allowed_mentions=discord.AllowedMentions.none(),
                     )
+                    if reping_staff_roles and notified_roles:
+                        await staff_channel.send(
+                            content=(
+                                f"{role_mentions}\n"
+                                f"Ticket category changed to **{record.category.label}**."
+                            ),
+                            allowed_mentions=discord.AllowedMentions(
+                                users=False,
+                                roles=notified_roles,
+                                everyone=False,
+                            ),
+                        )
         except (discord.Forbidden, discord.NotFound, discord.HTTPException):
             logger.exception("Could not refresh state embed for ticket %s", ticket_id)
 
