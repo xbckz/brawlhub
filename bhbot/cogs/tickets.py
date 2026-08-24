@@ -46,6 +46,7 @@ MESSAGE_CHANNEL_CACHE_SECONDS = 60.0
 NON_TICKET_CHANNEL_CACHE_SECONDS = 300.0
 ACTIVITY_WRITE_COOLDOWN_SECONDS = 15.0
 VISIBLE_MEMBER_CACHE_SECONDS = 60.0
+STAFF_THREAD_MEMBER_LIMIT = 1000
 DEFAULT_SUBCATEGORY_EMOJIS = (
     "1️⃣", "2️⃣", "3️⃣", "4️⃣", "5️⃣",
     "6️⃣", "7️⃣", "8️⃣", "9️⃣", "🔟",
@@ -1021,6 +1022,7 @@ class TicketsCog(commands.Cog):
         self.non_ticket_channel_cache: dict[int, float] = {}
         self.activity_write_at: dict[int, float] = {}
         self.visible_member_cache: dict[int, tuple[float, list[discord.Member]]] = {}
+        self.staff_thread_role_sync: dict[int, frozenset[str]] = {}
         self.priority_sync_tasks: dict[uuid.UUID, asyncio.Task[None]] = {}
         self.pending_priority_syncs: set[uuid.UUID] = set()
     async def visible_members_for_channel(
@@ -1152,6 +1154,7 @@ class TicketsCog(commands.Cog):
         self.non_ticket_channel_cache.clear()
         self.activity_write_at.clear()
         self.visible_member_cache.clear()
+        self.staff_thread_role_sync.clear()
         self.priority_sync_tasks.clear()
         self.pending_priority_syncs.clear()
     async def interaction_ticket(
@@ -1463,6 +1466,65 @@ class TicketsCog(commands.Cog):
                 exc_info=True,
             )
 
+    async def _sync_staff_members_without_role_ping(
+        self,
+        thread: discord.Thread,
+        guild: discord.Guild,
+        staff_role_ids: list[str],
+    ) -> None:
+        """Add staff role members without mentioning or pinging the role."""
+        role_key = frozenset(str(role_id) for role_id in staff_role_ids)
+        if self.staff_thread_role_sync.get(thread.id) == role_key:
+            return
+        if not self.bot.settings.discord_members_intent_enabled:
+            logger.warning(
+                "Cannot connect staff members to private ticket thread %s without "
+                "DISCORD_MEMBERS_INTENT_ENABLED",
+                thread.id,
+            )
+            self.staff_thread_role_sync[thread.id] = role_key
+            return
+
+        members: dict[int, discord.Member] = {}
+        for role_id in staff_role_ids:
+            role = guild.get_role(int(role_id))
+            if role is None:
+                continue
+            for member in role.members:
+                if not member.bot:
+                    members[member.id] = member
+
+        ordered_members = sorted(
+            members.values(),
+            key=lambda member: (member.display_name.casefold(), member.id),
+        )[:STAFF_THREAD_MEMBER_LIMIT]
+        if len(members) > STAFF_THREAD_MEMBER_LIMIT:
+            logger.warning(
+                "Private ticket thread %s reached Discord's %s-member limit",
+                thread.id,
+                STAFF_THREAD_MEMBER_LIMIT,
+            )
+        try:
+            thread_members = await thread.fetch_members()
+        except (discord.Forbidden, discord.HTTPException):
+            thread_members = list(thread.members)
+        existing_member_ids = {member.id for member in thread_members}
+        bot_id = self.bot.user.id if self.bot.user else None
+        for member in ordered_members:
+            if member.id == bot_id or member.id in existing_member_ids:
+                continue
+            try:
+                await thread.add_user(member)
+                existing_member_ids.add(member.id)
+            except (discord.Forbidden, discord.HTTPException):
+                logger.warning(
+                    "Could not connect staff member %s to private ticket thread %s",
+                    member.id,
+                    thread.id,
+                    exc_info=True,
+                )
+        self.staff_thread_role_sync[thread.id] = role_key
+
     def _staff_control_roles(
         self,
         record: TicketRecord,
@@ -1471,11 +1533,8 @@ class TicketsCog(commands.Cog):
     ) -> tuple[list[discord.Role], list[discord.Role]]:
         """Return roles that can access the thread and roles that should notify.
 
-        A private thread does not become visible beneath its parent for a role
-        merely because that role has permission overwrites on the parent
-        channel.  When notifications are disabled, the access roles are still
-        mentioned with Discord's silent-message flag so the thread is attached
-        to the role without sending a notification.
+        The access roles control permissions. Notification roles are only used
+        for the optional visible role ping in the control message.
         """
         access_role_ids = record.category.staff_role_ids or record.panel.staff_role_ids
         notification_role_ids = (
@@ -1566,31 +1625,14 @@ class TicketsCog(commands.Cog):
                     )
                     if ticket.staff_control_message_id:
                         try:
-                            existing_message = await existing_channel.fetch_message(
+                            await existing_channel.fetch_message(
                                 int(ticket.staff_control_message_id)
                             )
-                            access_roles, notification_roles = self._staff_control_roles(
-                                record, channel.guild, can_mention_nonmentionable
-                            )
-                            connection_roles = notification_roles or access_roles
-                            connection_content = self._staff_role_mentions(connection_roles)
-                            if (
-                                connection_content
-                                and connection_content not in existing_message.content
-                            ):
-                                # Reconnect a role that was not present in an
-                                # older control message without generating a
-                                # duplicate notification during a routine
-                                # refresh.  A category change can still send
-                                # the deliberate notification below.
-                                await existing_channel.send(
-                                    content=connection_content,
-                                    allowed_mentions=discord.AllowedMentions(
-                                        users=False,
-                                        roles=connection_roles,
-                                        everyone=False,
-                                    ),
-                                    silent=True,
+                            if not record.category.notify_staff:
+                                await self._sync_staff_members_without_role_ping(
+                                    existing_channel,
+                                    channel.guild,
+                                    staff_role_ids,
                                 )
                             return
                         except discord.NotFound:
@@ -1615,18 +1657,22 @@ class TicketsCog(commands.Cog):
             await self._exclude_requester_from_staff_thread(
                 record, staff_thread, force=True
             )
-        access_roles, notification_roles = self._staff_control_roles(
+        _, notification_roles = self._staff_control_roles(
             record, channel.guild, can_mention_nonmentionable
         )
-        connection_roles = notification_roles or access_roles
+        if not record.category.notify_staff:
+            await self._sync_staff_members_without_role_ping(
+                staff_thread,
+                channel.guild,
+                staff_role_ids,
+            )
         message = await staff_thread.send(
-            content=self._staff_role_mentions(connection_roles),
+            content=self._staff_role_mentions(notification_roles),
             embed=await self.ticket_state_embed(record, include_notes=True),
             view=await self.ticket_controls_view(ticket.id, record=record),
             allowed_mentions=discord.AllowedMentions(
-                users=False, roles=connection_roles, everyone=False
+                users=False, roles=notification_roles, everyone=False
             ),
-            silent=not record.category.notify_staff and bool(connection_roles),
         )
         stored = (
             await self.repository.replace_staff_controls(
@@ -1711,11 +1757,10 @@ class TicketsCog(commands.Cog):
                             or bot_member.guild_permissions.mention_everyone
                         )
                     )
-                    access_roles, notification_roles = self._staff_control_roles(
+                    _, notification_roles = self._staff_control_roles(
                         record, staff_channel.guild, can_mention_nonmentionable
                     )
-                    connection_roles = notification_roles or access_roles
-                    role_mentions = self._staff_role_mentions(connection_roles)
+                    role_mentions = self._staff_role_mentions(notification_roles)
                     await staff_message.edit(
                         content=role_mentions or None,
                         embed=await self.ticket_state_embed(record, include_notes=True),
@@ -2107,23 +2152,15 @@ class TicketsCog(commands.Cog):
                 bot_member.guild_permissions.administrator
                 or bot_member.guild_permissions.mention_everyone
             )
-            access_role_ids = category.staff_role_ids or panel.staff_role_ids
             notification_role_ids = (
                 category.staff_role_ids if category.notify_staff else []
             )
-            access_roles = [
-                role
-                for role_id in access_role_ids
-                if (role := interaction.guild.get_role(int(role_id))) is not None
-                and (role.mentionable or bot_can_mention_nonmentionable)
-            ]
             notified_roles = [
                 role
                 for role_id in notification_role_ids
                 if (role := interaction.guild.get_role(int(role_id))) is not None
                 and (role.mentionable or bot_can_mention_nonmentionable)
             ]
-            connection_roles = notified_roles or access_roles
             opening_content = interaction.user.mention
             configured_opening_message = opening_message or panel.opening_message
             if configured_opening_message:
@@ -2148,8 +2185,14 @@ class TicketsCog(commands.Cog):
                 staff_thread,
                 force=True,
             )
+            if not category.notify_staff:
+                await self._sync_staff_members_without_role_ping(
+                    staff_thread,
+                    interaction.guild,
+                    category.staff_role_ids or panel.staff_role_ids,
+                )
             staff_controls = await staff_thread.send(
-                content=self._staff_role_mentions(connection_roles),
+                content=self._staff_role_mentions(notified_roles),
                 embed=embed,
                 view=TicketControlsView(
                     self,
@@ -2160,9 +2203,8 @@ class TicketsCog(commands.Cog):
                     ),
                 ),
                 allowed_mentions=discord.AllowedMentions(
-                    users=False, roles=connection_roles, everyone=False
+                    users=False, roles=notified_roles, everyone=False
                 ),
-                silent=not category.notify_staff and bool(connection_roles),
             )
             if (
                 await self.repository.finish_ticket_creation(
