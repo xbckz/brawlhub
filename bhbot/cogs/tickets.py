@@ -125,43 +125,6 @@ def ticket_staff_overwrite() -> discord.PermissionOverwrite:
     )
 
 
-def ticket_staff_channel_overwrites(
-    guild: discord.Guild,
-    bot_member: discord.Member,
-    staff_role_ids: list[str],
-) -> MutableMapping[
-    discord.Role | discord.Member | discord.Object,
-    discord.PermissionOverwrite,
-]:
-    """Create a role-gated parent for the staff control thread.
-
-    The thread itself is public, but its parent is invisible to @everyone and
-    grants access through the configured staff roles.  This lets Discord apply
-    role membership automatically instead of the bot inviting every member to
-    every private thread.
-    """
-    overwrites: MutableMapping[
-        discord.Role | discord.Member | discord.Object,
-        discord.PermissionOverwrite,
-    ] = {
-        guild.default_role: discord.PermissionOverwrite(view_channel=False),
-        bot_member: discord.PermissionOverwrite(
-            view_channel=True,
-            send_messages=True,
-            read_message_history=True,
-            manage_channels=True,
-            manage_messages=True,
-            manage_threads=True,
-            send_messages_in_threads=True,
-        ),
-    }
-    for role_id in staff_role_ids:
-        role = guild.get_role(int(role_id))
-        if role is not None:
-            overwrites[role] = ticket_staff_overwrite()
-    return overwrites
-
-
 def ticket_channel_overwrites(
     guild: discord.Guild,
     requester: discord.Member,
@@ -1474,48 +1437,34 @@ class TicketsCog(commands.Cog):
         if desired_name is not None:
             self.ticket_channel_names[channel.id] = updated.name
         return True
-    async def ensure_staff_parent_role_access(
-        self,
-        parent: discord.TextChannel,
-        staff_role_ids: list[str],
-    ) -> None:
-        """Keep the staff control parent accessible through roles only."""
-        desired = ticket_staff_overwrite()
-        for role_id in staff_role_ids:
-            role = parent.guild.get_role(int(role_id))
-            if role is None:
-                logger.warning(
-                    "Configured ticket staff role %s no longer exists in guild %s",
-                    role_id,
-                    parent.guild.id,
-                )
-                continue
-            permissions = parent.permissions_for(role)
-            if (
-                permissions.view_channel
-                and permissions.send_messages
-                and permissions.read_message_history
-                and permissions.send_messages_in_threads
-            ):
-                continue
-            try:
-                await parent.set_permissions(
-                    role,
-                    overwrite=desired,
-                    reason="Ensure ticket staff role access to control thread",
-                )
-            except (discord.Forbidden, discord.HTTPException):
-                logger.warning(
-                    "Could not synchronize staff role %s on control parent %s",
-                    role.id,
-                    parent.id,
-                    exc_info=True,
-                )
-
-    async def ensure_staff_controls(
+    async def _exclude_requester_from_staff_thread(
         self,
         record: TicketRecord,
+        thread: discord.Thread,
+        *,
+        force: bool = False,
     ) -> None:
+        """Keep the requester out of the private staff control thread."""
+        requester = thread.guild.get_member(int(record.ticket.requester_id))
+        if requester is None or has_ticket_staff_role(
+            requester, record.panel, record.category
+        ):
+            return
+        if not force and requester.id not in {member.id for member in thread.members}:
+            return
+        try:
+            await thread.remove_user(requester)
+        except discord.NotFound:
+            return
+        except (discord.Forbidden, discord.HTTPException):
+            logger.warning(
+                "Could not remove ticket requester %s from staff thread %s",
+                requester.id,
+                thread.id,
+                exc_info=True,
+            )
+
+    async def ensure_staff_controls(self, record: TicketRecord) -> None:
         ticket = record.ticket
         if not ticket.channel_id:
             return
@@ -1557,9 +1506,7 @@ class TicketsCog(commands.Cog):
                         exc_info=True,
                     )
         existing_channel: discord.TextChannel | discord.Thread | None = None
-        existing_message: discord.Message | None = None
-        legacy_channels: list[discord.abc.GuildChannel] = []
-        staff_parent_channel: discord.TextChannel | None = None
+        legacy_channels: list[discord.TextChannel | discord.Thread] = []
         staff_thread: discord.Thread | None = None
         has_existing_location = bool(ticket.staff_thread_id)
         if ticket.staff_thread_id:
@@ -1578,15 +1525,13 @@ class TicketsCog(commands.Cog):
                         candidate = None
                     parent = candidate if isinstance(candidate, discord.TextChannel) else None
                 if (
-                    existing_channel.type == discord.ChannelType.public_thread
-                    and isinstance(parent, discord.TextChannel)
-                    and parent.id != channel.id
+                    existing_channel.parent_id == channel.id
+                    and existing_channel.type == discord.ChannelType.private_thread
                 ):
-                    staff_parent_channel = parent
-                    await self.ensure_staff_parent_role_access(
-                        staff_parent_channel, staff_role_ids
-                    )
                     staff_thread = existing_channel
+                    await self._exclude_requester_from_staff_thread(
+                        record, staff_thread
+                    )
                     if ticket.staff_control_message_id:
                         try:
                             await existing_channel.fetch_message(
@@ -1596,41 +1541,24 @@ class TicketsCog(commands.Cog):
                         except discord.NotFound:
                             pass
                 else:
-                    # Migrate old private/direct ticket threads after the new
-                    # role-gated parent has been created.
                     legacy_channels.append(existing_channel)
+                    if (
+                        isinstance(parent, discord.TextChannel)
+                        and parent.id != channel.id
+                    ):
+                        legacy_channels.append(parent)
             elif isinstance(existing_channel, discord.TextChannel) and existing_channel.id != channel.id:
-                # Reuse a role-gated parent left by the older implementation.
-                staff_parent_channel = existing_channel
-                await self.ensure_staff_parent_role_access(
-                    staff_parent_channel, staff_role_ids
-                )
-                if ticket.staff_control_message_id:
-                    try:
-                        existing_message = await existing_channel.fetch_message(
-                            int(ticket.staff_control_message_id)
-                        )
-                    except discord.NotFound:
-                        existing_message = None
+                legacy_channels.append(existing_channel)
         if staff_thread is None:
-            if staff_parent_channel is None:
-                staff_parent_channel = await channel.guild.create_text_channel(
-                    name=f"staff-control-parent-{str(ticket.id)[:8]}",
-                    category=channel.category,
-                    overwrites=ticket_staff_channel_overwrites(
-                        channel.guild, bot_member, staff_role_ids
-                    ),
-                    reason="Create role-gated ticket staff control parent",
-                )
-                await self.ensure_staff_parent_role_access(
-                    staff_parent_channel, staff_role_ids
-                )
-            staff_thread = await staff_parent_channel.create_thread(
+            staff_thread = await channel.create_thread(
                 name=f"staff-controls-{str(ticket.id)[:8]}",
-                type=discord.ChannelType.public_thread,
+                type=discord.ChannelType.private_thread,
                 auto_archive_duration=10080,
                 invitable=False,
-                reason="Create ticket staff control thread",
+                reason="Create private ticket staff control thread",
+            )
+            await self._exclude_requester_from_staff_thread(
+                record, staff_thread, force=True
             )
         notified_roles = [
             role
@@ -1662,25 +1590,16 @@ class TicketsCog(commands.Cog):
         if not stored:
             await message.delete(reason="Duplicate ticket staff controls")
             return
-        if existing_message is not None and existing_message.channel.id != staff_thread.id:
-            try:
-                await existing_message.delete(reason="Move ticket controls into a thread")
-            except discord.HTTPException:
-                logger.warning(
-                    "Could not remove old ticket control message %s",
-                    existing_message.id,
-                )
         deleted_ids: set[int] = set()
         for legacy_channel in legacy_channels:
             if legacy_channel.id in deleted_ids or legacy_channel.id in {
                 channel.id,
-                staff_parent_channel.id if staff_parent_channel else 0,
                 staff_thread.id,
             }:
                 continue
             try:
                 await legacy_channel.delete(
-                    reason="Migrate ticket controls to role-gated thread"
+                    reason="Migrate ticket controls to direct private thread"
                 )
                 deleted_ids.add(legacy_channel.id)
             except discord.HTTPException:
@@ -2056,7 +1975,6 @@ class TicketsCog(commands.Cog):
             )
             return
         channel: discord.TextChannel | None = None
-        staff_parent_channel: discord.TextChannel | None = None
         staff_thread: discord.Thread | None = None
         creation_committed = False
         try:
@@ -2115,26 +2033,17 @@ class TicketsCog(commands.Cog):
                     users=[interaction.user], roles=False, everyone=False
                 ),
             )
-            staff_parent_channel = await interaction.guild.create_text_channel(
-                name=f"staff-control-parent-{str(ticket.id)[:8]}",
-                category=channel.category,
-                overwrites=ticket_staff_channel_overwrites(
-                    interaction.guild,
-                    bot_member,
-                    category.staff_role_ids or panel.staff_role_ids,
-                ),
-                reason="Create role-gated ticket staff control parent",
-            )
-            await self.ensure_staff_parent_role_access(
-                staff_parent_channel,
-                category.staff_role_ids or panel.staff_role_ids,
-            )
-            staff_thread = await staff_parent_channel.create_thread(
+            staff_thread = await channel.create_thread(
                 name=f"staff-controls-{str(ticket.id)[:8]}",
-                type=discord.ChannelType.public_thread,
+                type=discord.ChannelType.private_thread,
                 auto_archive_duration=10080,
                 invitable=False,
-                reason="Create ticket staff control thread",
+                reason="Create private ticket staff control thread",
+            )
+            await self._exclude_requester_from_staff_thread(
+                ticket_record,
+                staff_thread,
+                force=True,
             )
             staff_controls = await staff_thread.send(
                 content=" ".join(role.mention for role in notified_roles) or None,
@@ -2200,16 +2109,6 @@ class TicketsCog(commands.Cog):
                 except discord.HTTPException:
                     logger.exception(
                         "Could not roll back ticket staff thread %s", staff_thread.id
-                    )
-            if staff_parent_channel:
-                try:
-                    await staff_parent_channel.delete(
-                        reason="Rolling back failed ticket staff control parent"
-                    )
-                except discord.HTTPException:
-                    logger.exception(
-                        "Could not roll back ticket staff parent %s",
-                        staff_parent_channel.id,
                     )
             if channel:
                 try:
