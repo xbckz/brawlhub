@@ -707,6 +707,66 @@ class TicketButton(discord.ui.Button["TicketControlsView"]):
         await interaction.followup.send(result, ephemeral=True)
 
 
+class TicketJoinControlsButton(discord.ui.Button["TicketRequesterView"]):
+    def __init__(self, cog: "TicketsCog", ticket_id: uuid.UUID, side: str) -> None:
+        super().__init__(
+            label="━━━",
+            style=discord.ButtonStyle.secondary,
+            custom_id=f"ticket:{ticket_id}:join-controls-{side}",
+        )
+        self.cog = cog
+        self.ticket_id = ticket_id
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        record = await self.cog.interaction_ticket(interaction)
+        if record is None:
+            return
+        if not isinstance(interaction.user, discord.Member) or not is_ticket_staff(
+            interaction.user, record.panel, record.category
+        ):
+            # Acknowledge the component without exposing a response to normal
+            # ticket users.  Only eligible staff can join the private thread.
+            await interaction.response.defer(ephemeral=True)
+            return
+        await interaction.response.defer(ephemeral=True)
+        await self.cog.ensure_staff_controls(record)
+        current = await self.cog.repository.get_ticket(record.ticket.id)
+        if current is None or not current.ticket.staff_thread_id:
+            await interaction.followup.send(
+                "The staff control thread is not available yet.", ephemeral=True
+            )
+            return
+        thread = self.cog.bot.get_channel(int(current.ticket.staff_thread_id))
+        if thread is None:
+            try:
+                thread = await self.cog.bot.fetch_channel(
+                    int(current.ticket.staff_thread_id)
+                )
+            except discord.HTTPException:
+                thread = None
+        if not isinstance(thread, discord.Thread):
+            await interaction.followup.send(
+                "The staff control thread is not available.", ephemeral=True
+            )
+            return
+        try:
+            await thread.add_user(interaction.user)
+        except (discord.Forbidden, discord.HTTPException):
+            logger.warning(
+                "Could not add staff member %s to ticket control thread %s",
+                interaction.user.id,
+                thread.id,
+                exc_info=True,
+            )
+            await interaction.followup.send(
+                "I could not add you to the staff control thread.", ephemeral=True
+            )
+            return
+        await interaction.followup.send(
+            "You now have access to the staff control thread.", ephemeral=True
+        )
+
+
 class TicketAssigneeSelect(discord.ui.Select["TicketControlsView"]):
     def __init__(
         self,
@@ -993,17 +1053,27 @@ class TicketControlsView(SafeView):
 class TicketRequesterView(SafeView):
     """Requester-facing controls; staff administration stays ephemeral."""
 
-    def __init__(self, cog: "TicketsCog", ticket_id: uuid.UUID) -> None:
+    def __init__(
+        self,
+        cog: "TicketsCog",
+        ticket_id: uuid.UUID,
+        *,
+        join_controls: bool = False,
+    ) -> None:
         super().__init__(timeout=None)
+        if join_controls:
+            self.add_item(TicketJoinControlsButton(cog, ticket_id, "left"))
         self.add_item(
             TicketButton(
                 cog,
                 ticket_id,
                 "close",
-                "Close ticket",
+                "CLOSE",
                 discord.ButtonStyle.danger,
             )
         )
+        if join_controls:
+            self.add_item(TicketJoinControlsButton(cog, ticket_id, "right"))
 
 
 class TicketsCog(commands.Cog):
@@ -1100,7 +1170,11 @@ class TicketsCog(commands.Cog):
                 record = await self.repository.get_ticket(ticket.id)
             if ticket.control_message_id:
                 self.bot.add_view(
-                    TicketRequesterView(self, ticket.id),
+                    TicketRequesterView(
+                        self,
+                        ticket.id,
+                        join_controls=bool(record and not record.category.notify_staff),
+                    ),
                     message_id=int(ticket.control_message_id),
                 )
             if ticket.staff_control_message_id:
@@ -1638,7 +1712,15 @@ class TicketsCog(commands.Cog):
             active = record.ticket.status in {"open", "claimed"}
             await message.edit(
                 embed=await self.ticket_state_embed(record),
-                view=TicketRequesterView(self, ticket_id) if active else None,
+                view=(
+                    TicketRequesterView(
+                        self,
+                        ticket_id,
+                        join_controls=not record.category.notify_staff,
+                    )
+                    if active
+                    else None
+                ),
                 allowed_mentions=discord.AllowedMentions.none(),
             )
             await self.ensure_staff_controls(record)
@@ -2079,7 +2161,11 @@ class TicketsCog(commands.Cog):
             state_message = await channel.send(
                 content=opening_content,
                 embed=embed,
-                view=TicketRequesterView(self, ticket.id),
+                view=TicketRequesterView(
+                    self,
+                    ticket.id,
+                    join_controls=not category.notify_staff,
+                ),
                 allowed_mentions=discord.AllowedMentions(
                     users=[interaction.user], roles=False, everyone=False
                 ),
