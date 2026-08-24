@@ -99,6 +99,7 @@ def category_config(
     description: str | None,
     emoji: str | None,
     staff_role_ids: list[int],
+    notify_staff: bool,
     form_fields: list[dict[str, Any]] | None = None,
 ) -> TicketCategoryConfig:
     return {
@@ -110,6 +111,7 @@ def category_config(
         "description": description[:100] if description else None,
         "emoji": emoji[:100] if emoji else None,
         "staff_role_ids": staff_role_ids,
+        "notify_staff": notify_staff,
         "form_fields": form_fields or [],
     }
 
@@ -152,6 +154,7 @@ def category_configs(categories: list[TicketPanelCategory]) -> list[TicketCatego
             description=item.description,
             emoji=item.emoji,
             staff_role_ids=[int(value) for value in item.staff_role_ids],
+            notify_staff=item.notify_staff,
             form_fields=item.form_fields,
         )
         for item in categories
@@ -389,7 +392,8 @@ class PanelEditorView(SafeView):
                 (
                     f"{item.emoji or '•'} **{item.label}** — {item.description or 'No description'}\n"
                     f"Target: <#{item.target_category_id or panel.open_category_id}> · "
-                    f"Ping: {', '.join(f'<@&{role_id}>' for role_id in item.staff_role_ids) or '(none)'} · "
+                    f"Ping: {'Yes' if item.notify_staff else 'No'} · "
+                    f"Roles: {', '.join(f'<@&{role_id}>' for role_id in item.staff_role_ids) or '(none)'} · "
                     f"First-question options: {len(item.subcategories)}"
                 )
                 for item in self.record.categories[:25]
@@ -645,7 +649,7 @@ class PanelEditorView(SafeView):
             manager.message = await interaction.original_response()
         elif action == "add-category":
             await interaction.response.send_message(
-                "Choose the Discord category where this ticket type will be created and the roles to ping.",
+                "Choose the Discord category, staff roles with control access, and whether those roles should be pinged.",
                 view=PanelCategoryRoutingView(self, message),
                 ephemeral=True,
             )
@@ -658,7 +662,7 @@ class PanelEditorView(SafeView):
                 await respond_ephemeral(interaction, "Select a category first.")
                 return
             await interaction.response.send_message(
-                "Choose the Discord category where this ticket type will be created and the roles to ping.",
+                "Choose the Discord category, staff roles with control access, and whether those roles should be pinged.",
                 view=PanelCategoryRoutingView(self, message, selected),
                 ephemeral=True,
             )
@@ -926,12 +930,40 @@ class PanelRoutesModal(PanelEditorModal):
         )
 
 
+class PanelNotifyRolesSelect(discord.ui.Select[Any]):
+    def __init__(self, panel_id: uuid.UUID, default: bool) -> None:
+        super().__init__(
+            placeholder="Ping selected roles in the control thread?",
+            min_values=1,
+            max_values=1,
+            row=2,
+            custom_id=f"ticket-category-routing-notify:{panel_id}",
+            options=[
+                discord.SelectOption(
+                    label="Yes",
+                    value="yes",
+                    description="Mention selected roles when a ticket opens or changes category.",
+                    default=default,
+                ),
+                discord.SelectOption(
+                    label="No",
+                    value="no",
+                    description="Do not mention roles; selected roles still access the controls.",
+                    default=not default,
+                ),
+            ],
+        )
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        await interaction.response.defer()
+
+
 class PanelCategoryRoutingContinueButton(discord.ui.Button[Any]):
     def __init__(self, routing: "PanelCategoryRoutingView") -> None:
         super().__init__(
             label="Continue",
             style=discord.ButtonStyle.success,
-            row=2,
+            row=3,
             custom_id=f"ticket-category-routing-continue:{routing.editor.panel_id}",
         )
         self.routing = routing
@@ -955,6 +987,13 @@ class PanelCategoryRoutingContinueButton(discord.ui.Button[Any]):
         if not target_values:
             await respond_ephemeral(interaction, "Select the Discord target category first.")
             return
+        notify_values = list(self.routing.notify_roles.values)
+        if not notify_values:
+            notify_values = [
+                option.value
+                for option in self.routing.notify_roles.options
+                if option.default
+            ]
         target_id = int(getattr(target_values[0], "id", 0))
         target = interaction.guild.get_channel(target_id)
         if not isinstance(target, discord.CategoryChannel):
@@ -962,7 +1001,7 @@ class PanelCategoryRoutingContinueButton(discord.ui.Button[Any]):
             return
         role_ids = [int(getattr(role, "id", 0)) for role in role_values]
         if any(interaction.guild.get_role(role_id) is None for role_id in role_ids):
-            await respond_ephemeral(interaction, "Every selected ping role must belong to this server.")
+            await respond_ephemeral(interaction, "Every selected staff role must belong to this server.")
             return
         await interaction.response.send_modal(
             PanelCategoryModal(
@@ -971,6 +1010,7 @@ class PanelCategoryRoutingContinueButton(discord.ui.Button[Any]):
                 self.routing.existing,
                 target_category_id=target.id,
                 staff_role_ids=role_ids,
+                notify_staff=notify_values[0] == "yes",
             )
         )
 
@@ -1021,15 +1061,20 @@ class PanelCategoryRoutingView(SafeView):
             default_values=default_target,
         )
         self.ping_roles = PanelCreateRoleSelect(
-            placeholder="Select roles to ping (optional)",
+            placeholder="Select staff roles with control access (optional)",
             min_values=0,
             max_values=25,
             row=1,
             custom_id=f"ticket-category-routing-roles:{editor.panel_id}",
             default_values=default_roles,
         )
+        self.notify_roles = PanelNotifyRolesSelect(
+            editor.panel_id,
+            existing.notify_staff if existing is not None else True,
+        )
         self.add_item(self.target_category)
         self.add_item(self.ping_roles)
+        self.add_item(self.notify_roles)
         self.add_item(PanelCategoryRoutingContinueButton(self))
 
 
@@ -1536,11 +1581,13 @@ class PanelCategoryModal(PanelEditorModal):
         *,
         target_category_id: int,
         staff_role_ids: list[int],
+        notify_staff: bool,
     ) -> None:
         super().__init__(editor, message, title="Edit ticket category" if existing else "Add ticket category")
         self.existing = existing
         self.target_category_id = target_category_id
         self.staff_role_ids = staff_role_ids
+        self.notify_staff = notify_staff
         self.label_input = discord.ui.TextInput(label="Category label", default=existing.label if existing else "", max_length=100)
         self.description_input = discord.ui.TextInput(label="Category description", style=discord.TextStyle.paragraph, default=existing.description if existing and existing.description else "", required=False, max_length=100)
         self.emoji_input = discord.ui.TextInput(label="Category emoji (Unicode/server emoji)", default=existing.emoji if existing and existing.emoji else "", required=False, max_length=100)
@@ -1588,7 +1635,7 @@ class PanelCategoryModal(PanelEditorModal):
             return
         roles = self.staff_role_ids
         if any(interaction.guild.get_role(role_id) is None for role_id in roles):
-            await respond_ephemeral(interaction, "Every selected ping role must belong to this server.")
+            await respond_ephemeral(interaction, "Every selected staff role must belong to this server.")
             return
         question = self.question_input.value.strip()[:45]
         form_fields = [
@@ -1621,6 +1668,7 @@ class PanelCategoryModal(PanelEditorModal):
             description=self.description_input.value.strip() or None,
             emoji=normalized_emoji,
             staff_role_ids=roles,
+            notify_staff=self.notify_staff,
             form_fields=form_fields,
         )
         if self.existing is None:

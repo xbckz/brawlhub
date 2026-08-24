@@ -39,6 +39,7 @@ class TicketCategoryConfig(TypedDict):
     description: str | None
     emoji: str | None
     staff_role_ids: list[int]
+    notify_staff: bool
     form_fields: list[TicketFormFieldConfig]
 
 
@@ -188,6 +189,7 @@ def _category(row: dict[str, Any]) -> TicketPanelCategory:
         description=str(row["description"]) if row["description"] is not None else None,
         emoji=str(row["emoji"]) if row["emoji"] is not None else None,
         staff_role_ids=[str(value) for value in _json(row["staff_role_ids"], [])],
+        notify_staff=bool(row.get("notify_staff", 1)),
         form_fields=list(_json(row["form_fields"], [])),
         position=int(row["position"]),
         active=bool(row["active"]),
@@ -268,6 +270,7 @@ SELECT t.*,
     c.subcategory_prompt AS category_subcategory_prompt, c.subcategories AS category_subcategories,
     c.key AS category_key, c.label AS category_label, c.description AS category_description,
     c.emoji AS category_emoji, c.staff_role_ids AS category_staff_role_ids,
+    c.notify_staff AS category_notify_staff,
     c.form_fields AS category_form_fields, c.position AS category_position, c.active AS category_active
 FROM tickets t
 JOIN ticket_panels p ON p.id = t.panel_id
@@ -381,6 +384,7 @@ class TicketRepository:
                 category["description"],
                 category["emoji"],
                 _json_text([str(value) for value in category["staff_role_ids"]]),
+                int(category["notify_staff"]),
                 _json_text(category["form_fields"]),
                 position,
                 1,
@@ -444,8 +448,8 @@ class TicketRepository:
             connection.executemany(
                 """
                 INSERT INTO ticket_panel_categories
-                (id, panel_id, target_category_id, subcategory_prompt, subcategories, key, label, description, emoji, staff_role_ids, form_fields, position, active)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                (id, panel_id, target_category_id, subcategory_prompt, subcategories, key, label, description, emoji, staff_role_ids, notify_staff, form_fields, position, active)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 category_rows,
             )
@@ -518,8 +522,8 @@ class TicketRepository:
             connection.executemany(
                 """
                 INSERT INTO ticket_panel_categories
-                (id, panel_id, target_category_id, subcategory_prompt, subcategories, key, label, description, emoji, staff_role_ids, form_fields, position, active)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                (id, panel_id, target_category_id, subcategory_prompt, subcategories, key, label, description, emoji, staff_role_ids, notify_staff, form_fields, position, active)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 category_rows,
             )
@@ -1080,6 +1084,7 @@ def _record_from_joined_row(row: dict[str, Any]) -> TicketRecord:
         "subcategories": row["category_subcategories"],
         "label": row["category_label"], "description": row["category_description"],
         "emoji": row["category_emoji"], "staff_role_ids": row["category_staff_role_ids"],
+        "notify_staff": row["category_notify_staff"],
         "form_fields": row["category_form_fields"], "position": row["category_position"],
         "active": row["category_active"],
     }

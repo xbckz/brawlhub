@@ -104,6 +104,7 @@ SCHEMA_STATEMENTS: tuple[str, ...] = (
         description TEXT,
         emoji TEXT,
         staff_role_ids TEXT NOT NULL DEFAULT '[]',
+        notify_staff INTEGER NOT NULL DEFAULT 1,
         form_fields TEXT NOT NULL DEFAULT '[]',
         position INTEGER NOT NULL,
         active INTEGER NOT NULL DEFAULT 1,
@@ -260,6 +261,10 @@ class Database:
             if "subcategories" not in category_columns:
                 connection.execute(
                     "ALTER TABLE ticket_panel_categories ADD COLUMN subcategories TEXT NOT NULL DEFAULT '[]'"
+                )
+            if "notify_staff" not in category_columns:
+                connection.execute(
+                    "ALTER TABLE ticket_panel_categories ADD COLUMN notify_staff INTEGER NOT NULL DEFAULT 1"
                 )
             ticket_columns = {
                 str(row[1])

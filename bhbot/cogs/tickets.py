@@ -1559,7 +1559,9 @@ class TicketsCog(commands.Cog):
             await self._exclude_requester_from_staff_thread(
                 record, staff_thread, force=True
             )
-        notification_role_ids = record.category.staff_role_ids
+        notification_role_ids = (
+            record.category.staff_role_ids if record.category.notify_staff else []
+        )
         notified_roles = [
             role
             for role_id in notification_role_ids
@@ -1657,7 +1659,11 @@ class TicketsCog(commands.Cog):
                             or bot_member.guild_permissions.mention_everyone
                         )
                     )
-                    notification_role_ids = record.category.staff_role_ids
+                    notification_role_ids = (
+                        record.category.staff_role_ids
+                        if record.category.notify_staff
+                        else []
+                    )
                     notified_roles = [
                         role
                         for role_id in notification_role_ids
@@ -2060,7 +2066,9 @@ class TicketsCog(commands.Cog):
             )
             notified_roles = [
                 role
-                for role_id in category.staff_role_ids
+                for role_id in (
+                    category.staff_role_ids if category.notify_staff else []
+                )
                 if (role := interaction.guild.get_role(int(role_id))) is not None
                 and (role.mentionable or bot_can_mention_nonmentionable)
             ]

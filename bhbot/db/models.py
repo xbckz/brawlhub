@@ -81,6 +81,7 @@ class TicketPanelCategory:
     description: str | None
     emoji: str | None
     staff_role_ids: list[str]
+    notify_staff: bool
     form_fields: list[dict[str, Any]]
     position: int
     active: bool
