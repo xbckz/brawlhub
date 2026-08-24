@@ -375,8 +375,6 @@ class TicketFlowOptionButton(discord.ui.Button["TicketFlowView"]):
         if not isinstance(children, dict):
             return
         options = [item for item in children.get("options", []) if isinstance(item, dict)][:25]
-        if not options:
-            return
         await self.flow_view.cog.send_ticket_flow_message(
             channel,
             record,
@@ -1877,15 +1875,23 @@ class TicketsCog(commands.Cog):
     ) -> discord.Message:
         """Send one normal in-ticket question and its emoji button choices."""
         options = [item for item in node.get("options", []) if isinstance(item, dict)][:25]
-        view = TicketFlowView(
-            self,
-            record.ticket.id,
-            record,
-            {"prompt": node.get("prompt"), "options": options},
-        )
+        content = ticket_flow_question_content(node, channel.guild)
+        if not options:
+            # A final layer can intentionally contain only a normal message.
+            # Do not send an empty component container; Discord rejects it or
+            # renders nothing, which previously made this layer disappear.
+            return await channel.send(
+                content,
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
         return await channel.send(
-            ticket_flow_question_content(node, channel.guild),
-            view=view,
+            content,
+            view=TicketFlowView(
+                self,
+                record.ticket.id,
+                record,
+                {"prompt": node.get("prompt"), "options": options},
+            ),
             allowed_mentions=discord.AllowedMentions.none(),
         )
 
