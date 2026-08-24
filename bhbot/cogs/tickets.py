@@ -1423,11 +1423,44 @@ class TicketsCog(commands.Cog):
                 record.ticket.id,
             )
             return False
-        if channel.category_id == target.id:
+
+        # Keep the room name aligned with the selected ticket category as well
+        # as moving the room itself.  Use the same naming rules as ticket
+        # creation, including the status dot and three-digit ticket number.
+        requester = channel.guild.get_member(int(record.ticket.requester_id))
+        if requester is None:
+            try:
+                requester = await channel.guild.fetch_member(
+                    int(record.ticket.requester_id)
+                )
+            except (discord.NotFound, discord.HTTPException):
+                requester = None
+
+        desired_name: str | None = None
+        if requester is not None:
+            desired_name = status_channel_name(
+                safe_channel_name(
+                    record.panel.name_template,
+                    requester,
+                    category.key,
+                    record.ticket.id,
+                    record.ticket.ticket_number,
+                ),
+                record.ticket.status,
+            )
+
+        edit_kwargs: dict[str, object] = {}
+        if channel.category_id != target.id:
+            edit_kwargs["category"] = target
+        if desired_name is not None and channel.name != desired_name:
+            edit_kwargs["name"] = desired_name
+        if not edit_kwargs:
+            if desired_name is not None:
+                self.ticket_channel_names[channel.id] = desired_name
             return True
         try:
-            await channel.edit(
-                category=target,
+            updated = await channel.edit(
+                **edit_kwargs,
                 reason=f"Route ticket to {category.label} category",
             )
         except (discord.Forbidden, discord.HTTPException):
@@ -1438,6 +1471,8 @@ class TicketsCog(commands.Cog):
                 exc_info=True,
             )
             return False
+        if desired_name is not None:
+            self.ticket_channel_names[channel.id] = updated.name
         return True
     async def ensure_staff_parent_role_access(
         self,
