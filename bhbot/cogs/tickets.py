@@ -45,8 +45,6 @@ STATUS_DOT_PREFIX = re.compile(r"^[🟢🔵🔴⚫⚪]\s*[・•·-]?\s*")
 MESSAGE_CHANNEL_CACHE_SECONDS = 60.0
 NON_TICKET_CHANNEL_CACHE_SECONDS = 300.0
 ACTIVITY_WRITE_COOLDOWN_SECONDS = 15.0
-STAFF_MEMBER_CACHE_SECONDS = 300.0
-STAFF_THREAD_SYNC_COOLDOWN_SECONDS = 300.0
 VISIBLE_MEMBER_CACHE_SECONDS = 60.0
 DEFAULT_SUBCATEGORY_EMOJIS = (
     "1️⃣", "2️⃣", "3️⃣", "4️⃣", "5️⃣",
@@ -125,6 +123,43 @@ def ticket_staff_overwrite() -> discord.PermissionOverwrite:
         manage_messages=True,
         attach_files=True,
     )
+
+
+def ticket_staff_channel_overwrites(
+    guild: discord.Guild,
+    bot_member: discord.Member,
+    staff_role_ids: list[str],
+) -> MutableMapping[
+    discord.Role | discord.Member | discord.Object,
+    discord.PermissionOverwrite,
+]:
+    """Create a role-gated parent for the staff control thread.
+
+    The thread itself is public, but its parent is invisible to @everyone and
+    grants access through the configured staff roles.  This lets Discord apply
+    role membership automatically instead of the bot inviting every member to
+    every private thread.
+    """
+    overwrites: MutableMapping[
+        discord.Role | discord.Member | discord.Object,
+        discord.PermissionOverwrite,
+    ] = {
+        guild.default_role: discord.PermissionOverwrite(view_channel=False),
+        bot_member: discord.PermissionOverwrite(
+            view_channel=True,
+            send_messages=True,
+            read_message_history=True,
+            manage_channels=True,
+            manage_messages=True,
+            manage_threads=True,
+            send_messages_in_threads=True,
+        ),
+    }
+    for role_id in staff_role_ids:
+        role = guild.get_role(int(role_id))
+        if role is not None:
+            overwrites[role] = ticket_staff_overwrite()
+    return overwrites
 
 
 def ticket_channel_overwrites(
@@ -923,7 +958,6 @@ class TicketCategorySelect(discord.ui.Select["TicketCategoryView"]):
             )
             await self.cog.refresh_ticket_state(
                 record.ticket.id,
-                force_staff_member_refresh=True,
             )
         await interaction.edit_original_response(
             content=(
@@ -1027,85 +1061,6 @@ class TicketsCog(commands.Cog):
         self.visible_member_cache: dict[int, tuple[float, list[discord.Member]]] = {}
         self.priority_sync_tasks: dict[uuid.UUID, asyncio.Task[None]] = {}
         self.pending_priority_syncs: set[uuid.UUID] = set()
-        self.staff_thread_member_sync_at: dict[int, float] = {}
-        self.staff_member_cache: dict[
-            int, tuple[float, dict[int, discord.Member]]
-        ] = {}
-        self.staff_member_fetch_locks: dict[int, asyncio.Lock] = {}
-        self.ticket_staff_role_index: dict[
-            int, dict[int, set[uuid.UUID]]
-        ] = defaultdict(lambda: defaultdict(set))
-        self.ticket_staff_roles_by_ticket: dict[uuid.UUID, tuple[int, set[int]]] = {}
-        self.staff_member_sync_tasks: set[asyncio.Task[None]] = set()
-        self.staff_member_sync_locks: dict[int, asyncio.Lock] = {}
-
-    def _remove_ticket_staff_role_index(self, ticket_id: uuid.UUID) -> None:
-        previous = self.ticket_staff_roles_by_ticket.pop(ticket_id, None)
-        if previous is not None:
-            previous_guild_id, previous_role_ids = previous
-            guild_index = self.ticket_staff_role_index.get(previous_guild_id, {})
-            for role_id in previous_role_ids:
-                tickets = guild_index.get(role_id)
-                if tickets is not None:
-                    tickets.discard(ticket_id)
-                    if not tickets:
-                        guild_index.pop(role_id, None)
-
-    def _index_ticket_staff_roles(self, record: TicketRecord) -> None:
-        """Index configured staff roles so role updates avoid a ticket scan."""
-        ticket_id = record.ticket.id
-        if record.ticket.status not in {"open", "claimed", "closed"}:
-            self._remove_ticket_staff_role_index(ticket_id)
-            return
-        guild_id = int(record.ticket.guild_id)
-        role_ids = {
-            int(role_id)
-            for role_id in (record.category.staff_role_ids or record.panel.staff_role_ids)
-        }
-        self._remove_ticket_staff_role_index(ticket_id)
-        self.ticket_staff_roles_by_ticket[ticket_id] = (guild_id, role_ids)
-        for role_id in role_ids:
-            self.ticket_staff_role_index[guild_id][role_id].add(ticket_id)
-
-    async def _staff_members_for_guild(
-        self,
-        guild: discord.Guild,
-        *,
-        additional_members: list[discord.Member] | None = None,
-    ) -> dict[int, discord.Member]:
-        """Share one member snapshot across all ticket control threads."""
-        now = asyncio.get_running_loop().time()
-        cached = self.staff_member_cache.get(guild.id)
-        if cached is None or now - cached[0] >= STAFF_MEMBER_CACHE_SECONDS:
-            lock = self.staff_member_fetch_locks.setdefault(guild.id, asyncio.Lock())
-            async with lock:
-                now = asyncio.get_running_loop().time()
-                cached = self.staff_member_cache.get(guild.id)
-                if cached is None or now - cached[0] >= STAFF_MEMBER_CACHE_SECONDS:
-                    members = {member.id: member for member in guild.members}
-                    cache_is_complete = (
-                        guild.member_count is not None
-                        and len(members) >= guild.member_count
-                    )
-                    if (
-                        self.bot.settings.discord_members_intent_enabled
-                        and not cache_is_complete
-                    ):
-                        try:
-                            async for member in guild.fetch_members(limit=None):
-                                members[member.id] = member
-                        except discord.HTTPException:
-                            logger.warning(
-                                "Could not refresh cached guild members for ticket control threads in %s",
-                                guild.id,
-                            )
-                    cached = (now, members)
-                    self.staff_member_cache[guild.id] = cached
-        members = cached[1]
-        for member in additional_members or []:
-            members[member.id] = member
-        return members
-
     async def visible_members_for_channel(
         self, channel: discord.TextChannel, *, exclude_member_id: int | None = None
     ) -> list[discord.Member]:
@@ -1146,95 +1101,6 @@ class TicketsCog(commands.Cog):
             if member.id != exclude_member_id
         ]
 
-    async def _exclude_requester_from_staff_thread(
-        self,
-        record: TicketRecord,
-        thread: discord.Thread,
-        *,
-        force: bool = False,
-    ) -> None:
-        """Keep a non-staff ticket requester out of the private staff thread."""
-        requester = thread.guild.get_member(int(record.ticket.requester_id))
-        if requester is None or has_ticket_staff_role(
-            requester, record.panel, record.category
-        ):
-            return
-        if not force and requester.id not in {member.id for member in thread.members}:
-            return
-        try:
-            await thread.remove_user(requester)
-        except discord.NotFound:
-            # The requester was not a thread member, which is already the
-            # desired state.
-            return
-        except (discord.Forbidden, discord.HTTPException):
-            logger.warning(
-                "Could not remove ticket requester %s from staff thread %s",
-                requester.id,
-                thread.id,
-                exc_info=True,
-            )
-
-    async def _sync_requester_thread_visibility(
-        self,
-        channel: discord.TextChannel,
-        record: TicketRecord,
-        staff_role_ids: list[str],
-    ) -> None:
-        """Keep the requester from creating or messaging private threads."""
-        requester = channel.guild.get_member(int(record.ticket.requester_id))
-        if requester is None:
-            return
-        overwrite = channel.overwrites_for(requester)
-        staff_member = requester.guild_permissions.manage_channels or has_ticket_staff_role_ids(
-            requester, staff_role_ids
-        )
-        if staff_member:
-            if (
-                overwrite.manage_threads is not False
-                and overwrite.send_messages_in_threads is not False
-            ):
-                return
-            overwrite.update(
-                manage_threads=None,
-                send_messages_in_threads=None,
-            )
-        else:
-            if (
-                overwrite.manage_threads is False
-                and overwrite.send_messages_in_threads is False
-            ):
-                return
-            overwrite.update(
-                manage_threads=False,
-                send_messages_in_threads=False,
-            )
-        try:
-            await channel.set_permissions(
-                requester,
-                overwrite=overwrite,
-                reason="Keep ticket staff controls private from requester",
-            )
-        except discord.Forbidden:
-            # Discord can reject member overwrites when the bot lacks Manage
-            # Roles or the requester is above the bot's highest role. This is
-            # maintenance, not ticket creation; keep the ticket usable and
-            # let the administrator fix the server permissions separately.
-            logger.warning(
-                "Could not synchronize requester thread permissions for ticket %s; "
-                "check Manage Roles and the bot role hierarchy",
-                record.ticket.id,
-            )
-            return
-        except discord.HTTPException:
-            logger.warning(
-                "Could not synchronize requester thread permissions for ticket %s",
-                record.ticket.id,
-                exc_info=True,
-            )
-            return
-        self.visible_member_cache.pop(channel.id, None)
-
     async def ticket_controls_view(
         self,
         ticket_id: uuid.UUID,
@@ -1270,8 +1136,6 @@ class TicketsCog(commands.Cog):
             record: TicketRecord | None = None
             if ticket.staff_control_message_id:
                 record = await self.repository.get_ticket(ticket.id)
-                if record is not None:
-                    self._index_ticket_staff_roles(record)
             if ticket.control_message_id:
                 self.bot.add_view(
                     TicketRequesterView(self, ticket.id),
@@ -1328,16 +1192,6 @@ class TicketsCog(commands.Cog):
         self.visible_member_cache.clear()
         self.priority_sync_tasks.clear()
         self.pending_priority_syncs.clear()
-        self.staff_thread_member_sync_at.clear()
-        self.staff_member_cache.clear()
-        self.staff_member_fetch_locks.clear()
-        self.ticket_staff_role_index.clear()
-        self.ticket_staff_roles_by_ticket.clear()
-        self.staff_member_sync_locks.clear()
-        for task in self.staff_member_sync_tasks:
-            task.cancel()
-        self.staff_member_sync_tasks.clear()
-
     async def interaction_ticket(
         self, interaction: discord.Interaction, *, require_staff: bool = False
     ) -> TicketRecord | None:
@@ -1585,90 +1439,49 @@ class TicketsCog(commands.Cog):
             )
             return False
         return True
-    async def add_staff_to_thread(
+    async def ensure_staff_parent_role_access(
         self,
-        thread: discord.Thread,
-        guild: discord.Guild,
+        parent: discord.TextChannel,
         staff_role_ids: list[str],
-        *,
-        force_member_refresh: bool = False,
-        additional_members: list[discord.Member] | None = None,
     ) -> None:
-        """Keep role members in the private staff control chat, not the ticket chat."""
-        configured_role_ids = set(staff_role_ids)
-        now = asyncio.get_running_loop().time()
-        if not configured_role_ids:
-            bot_id = self.bot.user.id if self.bot.user else None
-            for thread_member in thread.members:
-                if thread_member.id == bot_id:
-                    continue
-                try:
-                    await thread.remove_user(thread_member)
-                except (discord.Forbidden, discord.HTTPException):
-                    logger.warning(
-                        "Could not remove obsolete ticket staff member %s from control thread %s",
-                        thread_member.id,
-                        thread.id,
-                    )
-            self.staff_thread_member_sync_at[thread.id] = now
-            return
-        last_sync = self.staff_thread_member_sync_at.get(thread.id, 0.0)
-        if (
-            not force_member_refresh
-            and not additional_members
-            and now - last_sync < STAFF_THREAD_SYNC_COOLDOWN_SECONDS
-        ):
-            return
-        members = await self._staff_members_for_guild(
-            guild,
-            additional_members=additional_members,
-        )
-        member_values = tuple(members.values())
-        bot_id = self.bot.user.id if self.bot.user else None
-        for thread_member in thread.members:
-            member = members.get(thread_member.id)
-            # Discord returns ThreadMember objects here, which only expose the
-            # member ID. Resolve the full guild Member before checking roles.
+        """Keep the staff control parent accessible through roles only."""
+        desired = ticket_staff_overwrite()
+        for role_id in staff_role_ids:
+            role = parent.guild.get_role(int(role_id))
+            if role is None:
+                logger.warning(
+                    "Configured ticket staff role %s no longer exists in guild %s",
+                    role_id,
+                    parent.guild.id,
+                )
+                continue
+            permissions = parent.permissions_for(role)
             if (
-                thread_member.id == bot_id
-                or member is None
-                or member.bot
-                or configured_role_ids.intersection(str(role.id) for role in member.roles)
+                permissions.view_channel
+                and permissions.send_messages
+                and permissions.read_message_history
+                and permissions.send_messages_in_threads
             ):
                 continue
             try:
-                await thread.remove_user(thread_member)
+                await parent.set_permissions(
+                    role,
+                    overwrite=desired,
+                    reason="Ensure ticket staff role access to control thread",
+                )
             except (discord.Forbidden, discord.HTTPException):
                 logger.warning(
-                    "Could not remove ticket staff member %s from control thread %s",
-                    thread_member.id,
-                    thread.id,
+                    "Could not synchronize staff role %s on control parent %s",
+                    role.id,
+                    parent.id,
+                    exc_info=True,
                 )
-        existing_member_ids = {thread_member.id for thread_member in thread.members}
-        for member in member_values:
-            if member.bot or not configured_role_ids.intersection(
-                str(role.id) for role in member.roles
-            ) or member.id in existing_member_ids:
-                continue
-            try:
-                await thread.add_user(member)
-            except (discord.Forbidden, discord.HTTPException):
-                logger.warning(
-                    "Could not add ticket staff member %s to control thread %s",
-                    member.id,
-                    thread.id,
-                )
-        self.staff_thread_member_sync_at[thread.id] = now
 
     async def ensure_staff_controls(
         self,
         record: TicketRecord,
-        *,
-        changed_member: discord.Member | None = None,
-        force_member_refresh: bool = False,
     ) -> None:
         ticket = record.ticket
-        self._index_ticket_staff_roles(record)
         if not ticket.channel_id:
             return
         channel = self.bot.get_channel(int(ticket.channel_id))
@@ -1677,16 +1490,12 @@ class TicketsCog(commands.Cog):
         if not isinstance(channel, discord.TextChannel):
             return
         bot_member = channel.guild.me
+        if bot_member is None:
+            return
         staff_role_ids = record.category.staff_role_ids or record.panel.staff_role_ids
-        await self._sync_requester_thread_visibility(
-            channel, record, staff_role_ids
-        )
         can_mention_nonmentionable = bool(
-            bot_member
-            and (
-                bot_member.guild_permissions.administrator
-                or bot_member.guild_permissions.mention_everyone
-            )
+            bot_member.guild_permissions.administrator
+            or bot_member.guild_permissions.mention_everyone
         )
         desired_staff_overwrite = ticket_staff_overwrite()
         for role_id in staff_role_ids:
@@ -1713,9 +1522,10 @@ class TicketsCog(commands.Cog):
                         exc_info=True,
                     )
         existing_channel: discord.TextChannel | discord.Thread | None = None
-        legacy_channels: list[discord.TextChannel | discord.Thread] = []
+        existing_message: discord.Message | None = None
+        legacy_channels: list[discord.abc.GuildChannel] = []
+        staff_parent_channel: discord.TextChannel | None = None
         staff_thread: discord.Thread | None = None
-        thread_was_created = False
         has_existing_location = bool(ticket.staff_thread_id)
         if ticket.staff_thread_id:
             existing_channel = self.bot.get_channel(int(ticket.staff_thread_id))
@@ -1724,73 +1534,69 @@ class TicketsCog(commands.Cog):
                     existing_channel = await self.bot.fetch_channel(int(ticket.staff_thread_id))
                 except discord.HTTPException:
                     existing_channel = None
-            if isinstance(existing_channel, (discord.TextChannel, discord.Thread)):
+            if isinstance(existing_channel, discord.Thread):
+                parent = existing_channel.parent
+                if parent is None and existing_channel.parent_id:
+                    try:
+                        candidate = await self.bot.fetch_channel(existing_channel.parent_id)
+                    except discord.HTTPException:
+                        candidate = None
+                    parent = candidate if isinstance(candidate, discord.TextChannel) else None
                 if (
-                    isinstance(existing_channel, discord.Thread)
-                    and existing_channel.parent_id == channel.id
-                    and existing_channel.type == discord.ChannelType.private_thread
+                    existing_channel.type == discord.ChannelType.public_thread
+                    and isinstance(parent, discord.TextChannel)
+                    and parent.id != channel.id
                 ):
-                    staff_thread = existing_channel
-                    await self._exclude_requester_from_staff_thread(
-                        record, staff_thread
+                    staff_parent_channel = parent
+                    await self.ensure_staff_parent_role_access(
+                        staff_parent_channel, staff_role_ids
                     )
+                    staff_thread = existing_channel
                     if ticket.staff_control_message_id:
                         try:
                             await existing_channel.fetch_message(
                                 int(ticket.staff_control_message_id)
                             )
-                            await self.add_staff_to_thread(
-                                existing_channel,
-                                channel.guild,
-                                staff_role_ids,
-                                force_member_refresh=force_member_refresh,
-                                additional_members=(
-                                    [changed_member] if changed_member else None
-                                ),
-                            )
                             return
                         except discord.NotFound:
                             pass
                 else:
+                    # Migrate old private/direct ticket threads after the new
+                    # role-gated parent has been created.
                     legacy_channels.append(existing_channel)
-                    if isinstance(existing_channel, discord.Thread):
-                        parent = existing_channel.parent
-                        if parent is None and existing_channel.parent_id:
-                            try:
-                                candidate = await self.bot.fetch_channel(
-                                    existing_channel.parent_id
-                                )
-                            except discord.HTTPException:
-                                candidate = None
-                            parent = (
-                                candidate
-                                if isinstance(candidate, discord.TextChannel)
-                                else None
-                            )
-                        if (
-                            isinstance(parent, discord.TextChannel)
-                            and parent.id != channel.id
-                        ):
-                            legacy_channels.append(parent)
+            elif isinstance(existing_channel, discord.TextChannel) and existing_channel.id != channel.id:
+                # Reuse a role-gated parent left by the older implementation.
+                staff_parent_channel = existing_channel
+                await self.ensure_staff_parent_role_access(
+                    staff_parent_channel, staff_role_ids
+                )
+                if ticket.staff_control_message_id:
+                    try:
+                        existing_message = await existing_channel.fetch_message(
+                            int(ticket.staff_control_message_id)
+                        )
+                    except discord.NotFound:
+                        existing_message = None
         if staff_thread is None:
-            staff_thread = await channel.create_thread(
+            if staff_parent_channel is None:
+                staff_parent_channel = await channel.guild.create_text_channel(
+                    name=f"staff-control-parent-{str(ticket.id)[:8]}",
+                    category=channel.category,
+                    overwrites=ticket_staff_channel_overwrites(
+                        channel.guild, bot_member, staff_role_ids
+                    ),
+                    reason="Create role-gated ticket staff control parent",
+                )
+                await self.ensure_staff_parent_role_access(
+                    staff_parent_channel, staff_role_ids
+                )
+            staff_thread = await staff_parent_channel.create_thread(
                 name=f"staff-controls-{str(ticket.id)[:8]}",
-                type=discord.ChannelType.private_thread,
+                type=discord.ChannelType.public_thread,
                 auto_archive_duration=10080,
                 invitable=False,
-                reason="Create private ticket staff controls",
+                reason="Create ticket staff control thread",
             )
-            thread_was_created = True
-            await self._exclude_requester_from_staff_thread(
-                record, staff_thread, force=True
-            )
-        await self.add_staff_to_thread(
-            staff_thread,
-            channel.guild,
-            staff_role_ids,
-            force_member_refresh=thread_was_created or force_member_refresh,
-            additional_members=([changed_member] if changed_member else None),
-        )
         notified_roles = [
             role
             for role_id in staff_role_ids
@@ -1821,16 +1627,25 @@ class TicketsCog(commands.Cog):
         if not stored:
             await message.delete(reason="Duplicate ticket staff controls")
             return
+        if existing_message is not None and existing_message.channel.id != staff_thread.id:
+            try:
+                await existing_message.delete(reason="Move ticket controls into a thread")
+            except discord.HTTPException:
+                logger.warning(
+                    "Could not remove old ticket control message %s",
+                    existing_message.id,
+                )
         deleted_ids: set[int] = set()
         for legacy_channel in legacy_channels:
             if legacy_channel.id in deleted_ids or legacy_channel.id in {
                 channel.id,
+                staff_parent_channel.id if staff_parent_channel else 0,
                 staff_thread.id,
             }:
                 continue
             try:
                 await legacy_channel.delete(
-                    reason="Restore private ticket staff controls"
+                    reason="Migrate ticket controls to role-gated thread"
                 )
                 deleted_ids.add(legacy_channel.id)
             except discord.HTTPException:
@@ -1844,8 +1659,6 @@ class TicketsCog(commands.Cog):
         ticket_id: uuid.UUID,
         *,
         sync_channel_layout: bool = True,
-        staff_member: discord.Member | None = None,
-        force_staff_member_refresh: bool = False,
     ) -> None:
         record = await self.repository.get_ticket(ticket_id)
         if record is None or not record.ticket.channel_id:
@@ -1871,11 +1684,7 @@ class TicketsCog(commands.Cog):
                 view=TicketRequesterView(self, ticket_id) if active else None,
                 allowed_mentions=discord.AllowedMentions.none(),
             )
-            await self.ensure_staff_controls(
-                record,
-                changed_member=staff_member,
-                force_member_refresh=force_staff_member_refresh,
-            )
+            await self.ensure_staff_controls(record)
             record = await self.repository.get_ticket(ticket_id) or record
             if record.ticket.staff_thread_id and record.ticket.staff_control_message_id:
                 staff_channel = self.bot.get_channel(int(record.ticket.staff_thread_id))
@@ -2212,6 +2021,8 @@ class TicketsCog(commands.Cog):
             )
             return
         channel: discord.TextChannel | None = None
+        staff_parent_channel: discord.TextChannel | None = None
+        staff_thread: discord.Thread | None = None
         creation_committed = False
         try:
             target_category_id = int(
@@ -2269,23 +2080,26 @@ class TicketsCog(commands.Cog):
                     users=[interaction.user], roles=False, everyone=False
                 ),
             )
-            staff_thread = await channel.create_thread(
+            staff_parent_channel = await interaction.guild.create_text_channel(
+                name=f"staff-control-parent-{str(ticket.id)[:8]}",
+                category=channel.category,
+                overwrites=ticket_staff_channel_overwrites(
+                    interaction.guild,
+                    bot_member,
+                    category.staff_role_ids or panel.staff_role_ids,
+                ),
+                reason="Create role-gated ticket staff control parent",
+            )
+            await self.ensure_staff_parent_role_access(
+                staff_parent_channel,
+                category.staff_role_ids or panel.staff_role_ids,
+            )
+            staff_thread = await staff_parent_channel.create_thread(
                 name=f"staff-controls-{str(ticket.id)[:8]}",
-                type=discord.ChannelType.private_thread,
+                type=discord.ChannelType.public_thread,
                 auto_archive_duration=10080,
                 invitable=False,
-                reason="Create private ticket staff controls",
-            )
-            await self._exclude_requester_from_staff_thread(
-                ticket_record,
-                staff_thread,
-                force=True,
-            )
-            await self.add_staff_to_thread(
-                staff_thread,
-                interaction.guild,
-                category.staff_role_ids or panel.staff_role_ids,
-                force_member_refresh=True,
+                reason="Create ticket staff control thread",
             )
             staff_controls = await staff_thread.send(
                 content=" ".join(role.mention for role in notified_roles) or None,
@@ -2345,6 +2159,23 @@ class TicketsCog(commands.Cog):
                     f"Your ticket is ready: {channel.mention if channel else 'the ticket channel'}",
                 )
                 return
+            if staff_thread:
+                try:
+                    await staff_thread.delete(reason="Rolling back failed ticket staff thread")
+                except discord.HTTPException:
+                    logger.exception(
+                        "Could not roll back ticket staff thread %s", staff_thread.id
+                    )
+            if staff_parent_channel:
+                try:
+                    await staff_parent_channel.delete(
+                        reason="Rolling back failed ticket staff control parent"
+                    )
+                except discord.HTTPException:
+                    logger.exception(
+                        "Could not roll back ticket staff parent %s",
+                        staff_parent_channel.id,
+                    )
             if channel:
                 try:
                     await channel.delete(reason="Rolling back failed ticket creation")
@@ -2642,75 +2473,14 @@ class TicketsCog(commands.Cog):
     async def on_member_update(
         self, before: discord.Member, after: discord.Member
     ) -> None:
-        """Sync private ticket controls when a member gains or loses a staff role."""
+        """Invalidate member choices; staff thread access is role-managed by Discord."""
         if after.bot:
             return
-        before_role_ids = {role.id for role in before.roles}
-        after_role_ids = {role.id for role in after.roles}
-        changed_role_ids = before_role_ids.symmetric_difference(after_role_ids)
-        if not changed_role_ids:
-            return
-        cached = self.staff_member_cache.get(after.guild.id)
-        if cached is not None:
-            cached[1][after.id] = after
         self.visible_member_cache.clear()
-        configured_role_ids = self.ticket_staff_role_index.get(after.guild.id, {})
-        if not configured_role_ids or not changed_role_ids.intersection(
-            configured_role_ids
-        ):
-            return
-        task = asyncio.create_task(
-            self.synchronize_member_staff_controls(after, changed_role_ids),
-            name=f"ticket-staff-role-sync:{after.guild.id}:{after.id}",
-        )
-        self.staff_member_sync_tasks.add(task)
-        task.add_done_callback(self.staff_member_sync_tasks.discard)
 
     @commands.Cog.listener()
     async def on_member_remove(self, member: discord.Member) -> None:
-        cached = self.staff_member_cache.get(member.guild.id)
-        if cached is not None:
-            cached[1].pop(member.id, None)
         self.visible_member_cache.clear()
-
-    async def synchronize_member_staff_controls(
-        self, member: discord.Member, changed_role_ids: set[int]
-    ) -> None:
-        lock = self.staff_member_sync_locks.setdefault(member.id, asyncio.Lock())
-        try:
-            async with lock:
-                guild_role_index = self.ticket_staff_role_index.get(member.guild.id, {})
-                ticket_ids = {
-                    ticket_id
-                    for role_id in changed_role_ids
-                    for ticket_id in guild_role_index.get(role_id, set())
-                }
-                for ticket_id in ticket_ids:
-                    record = await self.repository.get_ticket(ticket_id)
-                    if record is None:
-                        self._remove_ticket_staff_role_index(ticket_id)
-                        continue
-                    configured_role_ids = {
-                        int(role_id)
-                        for role_id in (
-                            record.category.staff_role_ids
-                            or record.panel.staff_role_ids
-                        )
-                    }
-                    if not configured_role_ids.intersection(changed_role_ids):
-                        continue
-                    await self.refresh_ticket_state(
-                        ticket_id,
-                        sync_channel_layout=False,
-                        staff_member=member,
-                    )
-        except asyncio.CancelledError:
-            raise
-        except Exception:
-            logger.exception(
-                "Could not synchronize ticket controls after role update for member %s",
-                member.id,
-            )
 
     @tasks.loop(seconds=15.0)
     async def synchronize_panels(self) -> None:
