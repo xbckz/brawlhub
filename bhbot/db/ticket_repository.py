@@ -508,7 +508,7 @@ class TicketRepository:
                 (
                     values["panel_channel_id"], values["open_category_id"], values["archive_category_id"],
                     values["title"], values["description"], values["color"], values["emoji"],
-                    values["footer_text"], values["opening_message"], values["select_placeholder"], values["thumbnail_url"],
+                    values["footer_text"], values["select_placeholder"], values["opening_message"], values["thumbnail_url"],
                     values["image_url"], _json_text(values["staff_role_ids"]),
                     int(values["notify_staff_on_create"]), values["name_template"], values["max_open_per_user"],
                     values["duplicate_scope"], values["inactivity_reminder_hours"], values["auto_close_hours"],
