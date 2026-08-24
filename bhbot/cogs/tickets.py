@@ -623,18 +623,23 @@ class TicketButton(discord.ui.Button["TicketControlsView"]):
         label: str,
         style: discord.ButtonStyle,
         row: int = 0,
+        use_action_emoji: bool = True,
     ) -> None:
         super().__init__(
             label=label,
-            emoji={
-                "claim": "🙋",
-                "close": "🔒",
-                "reopen": "🔓",
-                "archive": "📦",
-                "note": "📝",
-                "delete": "🗑️",
-                "category": "🗂️",
-            }.get(action),
+            emoji=(
+                {
+                    "claim": "🙋",
+                    "close": "🔒",
+                    "reopen": "🔓",
+                    "archive": "📦",
+                    "note": "📝",
+                    "delete": "🗑️",
+                    "category": "🗂️",
+                }.get(action)
+                if use_action_emoji
+                else None
+            ),
             style=style,
             custom_id=f"ticket:{ticket_id}:{action}",
             row=row,
@@ -710,7 +715,7 @@ class TicketButton(discord.ui.Button["TicketControlsView"]):
 class TicketJoinControlsButton(discord.ui.Button["TicketRequesterView"]):
     def __init__(self, cog: "TicketsCog", ticket_id: uuid.UUID, side: str) -> None:
         super().__init__(
-            label="━━━",
+            label="[ ◈ ]",
             style=discord.ButtonStyle.secondary,
             custom_id=f"ticket:{ticket_id}:join-controls-{side}",
         )
@@ -720,6 +725,9 @@ class TicketJoinControlsButton(discord.ui.Button["TicketRequesterView"]):
     async def callback(self, interaction: discord.Interaction) -> None:
         record = await self.cog.interaction_ticket(interaction)
         if record is None:
+            return
+        if record.category.notify_staff:
+            await interaction.response.defer(ephemeral=True)
             return
         if not isinstance(interaction.user, discord.Member) or not is_ticket_staff(
             interaction.user, record.panel, record.category
@@ -1053,27 +1061,20 @@ class TicketControlsView(SafeView):
 class TicketRequesterView(SafeView):
     """Requester-facing controls; staff administration stays ephemeral."""
 
-    def __init__(
-        self,
-        cog: "TicketsCog",
-        ticket_id: uuid.UUID,
-        *,
-        join_controls: bool = False,
-    ) -> None:
+    def __init__(self, cog: "TicketsCog", ticket_id: uuid.UUID) -> None:
         super().__init__(timeout=None)
-        if join_controls:
-            self.add_item(TicketJoinControlsButton(cog, ticket_id, "left"))
+        self.add_item(TicketJoinControlsButton(cog, ticket_id, "left"))
         self.add_item(
             TicketButton(
                 cog,
                 ticket_id,
                 "close",
-                "CLOSE",
+                "[ 🔒 CLOSE ]",
                 discord.ButtonStyle.danger,
+                use_action_emoji=False,
             )
         )
-        if join_controls:
-            self.add_item(TicketJoinControlsButton(cog, ticket_id, "right"))
+        self.add_item(TicketJoinControlsButton(cog, ticket_id, "right"))
 
 
 class TicketsCog(commands.Cog):
@@ -1170,11 +1171,7 @@ class TicketsCog(commands.Cog):
                 record = await self.repository.get_ticket(ticket.id)
             if ticket.control_message_id:
                 self.bot.add_view(
-                    TicketRequesterView(
-                        self,
-                        ticket.id,
-                        join_controls=bool(record and not record.category.notify_staff),
-                    ),
+                    TicketRequesterView(self, ticket.id),
                     message_id=int(ticket.control_message_id),
                 )
             if ticket.staff_control_message_id:
@@ -1713,11 +1710,7 @@ class TicketsCog(commands.Cog):
             await message.edit(
                 embed=await self.ticket_state_embed(record),
                 view=(
-                    TicketRequesterView(
-                        self,
-                        ticket_id,
-                        join_controls=not record.category.notify_staff,
-                    )
+                    TicketRequesterView(self, ticket_id)
                     if active
                     else None
                 ),
@@ -2161,11 +2154,7 @@ class TicketsCog(commands.Cog):
             state_message = await channel.send(
                 content=opening_content,
                 embed=embed,
-                view=TicketRequesterView(
-                    self,
-                    ticket.id,
-                    join_controls=not category.notify_staff,
-                ),
+                view=TicketRequesterView(self, ticket.id),
                 allowed_mentions=discord.AllowedMentions(
                     users=[interaction.user], roles=False, everyone=False
                 ),
