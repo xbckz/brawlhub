@@ -389,7 +389,7 @@ class PanelEditorView(SafeView):
                 (
                     f"{item.emoji or '•'} **{item.label}** — {item.description or 'No description'}\n"
                     f"Target: <#{item.target_category_id or panel.open_category_id}> · "
-                    f"Ping: {', '.join(f'<@&{role_id}>' for role_id in (item.staff_role_ids or panel.staff_role_ids))} · "
+                    f"Ping: {', '.join(f'<@&{role_id}>' for role_id in item.staff_role_ids) or '(none)'} · "
                     f"First-question options: {len(item.subcategories)}"
                 )
                 for item in self.record.categories[:25]
@@ -947,16 +947,13 @@ class PanelCategoryRoutingContinueButton(discord.ui.Button[Any]):
                 for default in self.routing.target_category.default_values
             ]
         role_values = list(self.routing.ping_roles.values)
-        if not role_values:
+        if not self.routing.ping_roles.selection_touched and not role_values:
             role_values = [
                 discord.Object(id=int(default.id))
                 for default in self.routing.ping_roles.default_values
             ]
         if not target_values:
             await respond_ephemeral(interaction, "Select the Discord target category first.")
-            return
-        if not role_values:
-            await respond_ephemeral(interaction, "Select at least one role to ping for this ticket category.")
             return
         target_id = int(getattr(target_values[0], "id", 0))
         target = interaction.guild.get_channel(target_id)
@@ -996,8 +993,8 @@ class PanelCategoryRoutingView(SafeView):
         )
         default_role_ids = (
             existing.staff_role_ids
-            if existing and existing.staff_role_ids
-            else editor.record.panel.staff_role_ids
+            if existing is not None
+            else []
         )
         guild = editor.cog.bot.get_guild(int(editor.record.panel.guild_id))
         default_target = []
@@ -1024,8 +1021,8 @@ class PanelCategoryRoutingView(SafeView):
             default_values=default_target,
         )
         self.ping_roles = PanelCreateRoleSelect(
-            placeholder="Select roles to ping for this category",
-            min_values=1,
+            placeholder="Select roles to ping (optional)",
+            min_values=0,
             max_values=25,
             row=1,
             custom_id=f"ticket-category-routing-roles:{editor.panel_id}",
@@ -1590,8 +1587,8 @@ class PanelCategoryModal(PanelEditorModal):
             await respond_ephemeral(interaction, "The selected target Discord category is no longer available.")
             return
         roles = self.staff_role_ids
-        if not roles or any(interaction.guild.get_role(role_id) is None for role_id in roles):
-            await respond_ephemeral(interaction, "Select valid ping roles for this ticket category.")
+        if any(interaction.guild.get_role(role_id) is None for role_id in roles):
+            await respond_ephemeral(interaction, "Every selected ping role must belong to this server.")
             return
         question = self.question_input.value.strip()[:45]
         form_fields = [
@@ -1703,7 +1700,12 @@ class PanelCreateChannelSelect(discord.ui.ChannelSelect[Any]):
 
 
 class PanelCreateRoleSelect(discord.ui.RoleSelect[Any]):
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self.selection_touched = False
+
     async def callback(self, interaction: discord.Interaction) -> None:
+        self.selection_touched = True
         await interaction.response.defer()
 
 
