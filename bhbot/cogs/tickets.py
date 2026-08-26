@@ -580,14 +580,7 @@ class TicketNoteModal(SafeModal, title="Internal staff note"):
         )
 
 
-class TicketDeleteModal(SafeModal, title="Delete ticket permanently"):
-    confirmation: discord.ui.TextInput["TicketDeleteModal"] = discord.ui.TextInput(
-        label="Type DELETE to confirm",
-        placeholder="DELETE",
-        required=True,
-        min_length=6,
-        max_length=6,
-    )
+class TicketDeleteModal(SafeModal, title="Delete ticket"):
     reason: discord.ui.TextInput["TicketDeleteModal"] = discord.ui.TextInput(
         label="Reason (optional)",
         style=discord.TextStyle.paragraph,
@@ -601,11 +594,6 @@ class TicketDeleteModal(SafeModal, title="Delete ticket permanently"):
         self.ticket_id = ticket_id
 
     async def on_submit(self, interaction: discord.Interaction) -> None:
-        if str(self.confirmation.value).strip().upper() != "DELETE":
-            await interaction.response.send_message(
-                "Ticket deletion cancelled. Type DELETE exactly to confirm.", ephemeral=True
-            )
-            return
         await interaction.response.defer(ephemeral=True, thinking=True)
         await self.cog.delete_ticket(
             interaction,
