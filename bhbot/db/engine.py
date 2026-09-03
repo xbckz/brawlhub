@@ -174,19 +174,49 @@ class Database:
             raise ValueError("TURSO_DATABASE_URL must not be empty")
         self.is_remote = database_url.startswith(("libsql://", "https://", "http://"))
         if database_url == ":memory:" or database_url.startswith("file:"):
-            database = database_url
+            self._database = database_url
         elif database_url.startswith(("libsql://", "https://", "http://")):
-            database = database_url
+            self._database = database_url
         else:
-            database = str(Path(database_url))
-        self.connection = libsql.connect(
-            database=database,
-            auth_token=auth_token,
+            self._database = str(Path(database_url))
+        self._auth_token = auth_token
+        self.connection = self._connect_sync()
+        self._lock = asyncio.Lock()
+
+    def _connect_sync(self) -> Any:
+        """Open a connection and apply connection-local settings."""
+        connection = libsql.connect(
+            database=self._database,
+            auth_token=self._auth_token,
             _check_same_thread=False,
         )
-        self.connection.execute("PRAGMA foreign_keys = ON")
-        self.connection.commit()
-        self._lock = asyncio.Lock()
+        connection.execute("PRAGMA foreign_keys = ON")
+        connection.commit()
+        return connection
+
+    @staticmethod
+    def _is_stale_remote_stream(error: BaseException) -> bool:
+        """Return whether Hrana rejected the connection's expired stream.
+
+        Turso can expire a long-idle Hrana stream while the Python process keeps
+        the connection object alive. A new connection is safe to open for this
+        specific error because the rejected stream never reached the database.
+        Other errors are deliberately allowed to propagate unchanged.
+        """
+        return "stream not found:" in str(error).lower()
+
+    async def _recover_connection_locked(self, error: BaseException) -> None:
+        """Replace a stale remote connection while the database lock is held."""
+        if not self.is_remote or not self._is_stale_remote_stream(error):
+            raise error
+
+        old_connection = self.connection
+        logger.warning("Turso connection stream expired; reconnecting automatically")
+        try:
+            await asyncio.to_thread(old_connection.close)
+        except Exception:
+            logger.debug("Could not close the expired Turso connection", exc_info=True)
+        self.connection = await asyncio.to_thread(self._connect_sync)
 
     @staticmethod
     def _rows(cursor: Any) -> list[dict[str, Any]]:
@@ -198,7 +228,11 @@ class Database:
             def run() -> list[dict[str, Any]]:
                 return self._rows(self.connection.execute(sql, tuple(parameters)))
 
-            return await asyncio.to_thread(run)
+            try:
+                return await asyncio.to_thread(run)
+            except Exception as error:
+                await self._recover_connection_locked(error)
+                return await asyncio.to_thread(run)
 
     async def execute(self, sql: str, parameters: Sequence[Any] = ()) -> int:
         async with self._lock:
@@ -207,7 +241,11 @@ class Database:
                 self.connection.commit()
                 return int(cursor.rowcount)
 
-            return await asyncio.to_thread(run)
+            try:
+                return await asyncio.to_thread(run)
+            except Exception as error:
+                await self._recover_connection_locked(error)
+                return await asyncio.to_thread(run)
 
     async def transaction(self, callback: Callable[[Any], T]) -> T:
         async with self._lock:
@@ -221,7 +259,11 @@ class Database:
                     self.connection.rollback()
                     raise
 
-            return await asyncio.to_thread(run)
+            try:
+                return await asyncio.to_thread(run)
+            except Exception as error:
+                await self._recover_connection_locked(error)
+                return await asyncio.to_thread(run)
 
     async def ping(self) -> bool:
         try:
