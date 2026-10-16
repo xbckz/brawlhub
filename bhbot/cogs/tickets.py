@@ -1075,6 +1075,7 @@ class TicketsCog(commands.Cog):
         self.channel_sync_events: defaultdict[uuid.UUID, asyncio.Event] = defaultdict(
             asyncio.Event
         )
+        self.panel_sync_event = asyncio.Event()
         self.ticket_channel_names: dict[int, str] = {}
         self.ticket_channel_cache: dict[int, tuple[TicketRecord, float]] = {}
         self.non_ticket_channel_cache: dict[int, float] = {}
@@ -1191,6 +1192,11 @@ class TicketsCog(commands.Cog):
                             ticket.id,
                             exc_info=True,
                         )
+        # Process any queued work recovered or written before this cog loaded,
+        # then let panel changes wake the existing 15-second worker.  The
+        # worker still keeps its bounded batch size, but no longer queries the
+        # remote database when there is no panel work to process.
+        self.panel_sync_event.set()
         self.synchronize_panels.start()
         self.check_inactivity.start()
         self.refresh_existing_ticket_states.start()
@@ -1213,6 +1219,11 @@ class TicketsCog(commands.Cog):
         self.visible_member_cache.clear()
         self.priority_sync_tasks.clear()
         self.pending_priority_syncs.clear()
+
+    def request_panel_sync(self) -> None:
+        """Wake the panel worker after an admin queues panel work."""
+        self.panel_sync_event.set()
+
     async def interaction_ticket(
         self, interaction: discord.Interaction, *, require_staff: bool = False
     ) -> TicketRecord | None:
@@ -2532,11 +2543,26 @@ class TicketsCog(commands.Cog):
 
     @tasks.loop(seconds=15.0)
     async def synchronize_panels(self) -> None:
-        for _ in range(10):
-            record = await self.repository.claim_panel_sync()
-            if record is None:
-                return
-            await self._synchronize_panel(record)
+        if not self.panel_sync_event.is_set():
+            return
+        self.panel_sync_event.clear()
+        processed = 0
+        try:
+            for _ in range(10):
+                record = await self.repository.claim_panel_sync()
+                if record is None:
+                    return
+                processed += 1
+                await self._synchronize_panel(record)
+        except Exception:
+            # Keep queued work eligible if a transient database/Discord error
+            # causes discord.py's task loop to retry this iteration.
+            self.panel_sync_event.set()
+            raise
+        # There may be more queued panels than the bounded batch.  Keep the
+        # worker armed so the next tick drains the remainder.
+        if processed == 10:
+            self.panel_sync_event.set()
 
     @synchronize_panels.before_loop
     async def before_panel_sync(self) -> None:

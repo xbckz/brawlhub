@@ -430,7 +430,7 @@ class PanelEditorView(SafeView):
             return None
         values = panel_values(current.panel)
         values.update(changes)
-        return await self.cog.repository.update_panel(
+        updated = await self.cog.repository.update_panel(
             guild_id=int(current.panel.guild_id),
             panel_id=current.panel.id,
             actor_id=self.actor_id,
@@ -439,6 +439,11 @@ class PanelEditorView(SafeView):
             categories=categories or category_configs(current.categories),
             expected_revision=current.panel.revision,
         )
+        if updated is not None:
+            ticket_cog = self.cog.bot.get_cog("TicketsCog")
+            if ticket_cog is not None:
+                ticket_cog.request_panel_sync()
+        return updated
 
     async def set_emoji(
         self, target: str, emoji: str | None
@@ -572,6 +577,10 @@ class PanelEditorView(SafeView):
                 guild_id=int(self.record.panel.guild_id), panel_id=self.panel_id,
                 actor_id=interaction.user.id,
             )
+            if changed:
+                ticket_cog = self.cog.bot.get_cog("TicketsCog")
+                if ticket_cog is not None:
+                    ticket_cog.request_panel_sync()
             if message is not None:
                 await interaction.response.defer(ephemeral=True)
                 if changed:
@@ -1975,6 +1984,10 @@ class PanelManagerView(SafeView):
             changed = await self.cog.repository.queue_panel(
                 guild_id=interaction.guild.id, panel_id=record.panel.id, actor_id=interaction.user.id
             )
+            if changed:
+                ticket_cog = self.cog.bot.get_cog("TicketsCog")
+                if ticket_cog is not None:
+                    ticket_cog.request_panel_sync()
             await interaction.response.send_message(
                 "Panel synchronization queued." if changed else "That panel is currently busy.",
                 ephemeral=True,
@@ -1983,6 +1996,10 @@ class PanelManagerView(SafeView):
             changed = await self.cog.repository.request_panel_delete(
                 guild_id=interaction.guild.id, panel_id=record.panel.id, actor_id=interaction.user.id
             )
+            if changed:
+                ticket_cog = self.cog.bot.get_cog("TicketsCog")
+                if ticket_cog is not None:
+                    ticket_cog.request_panel_sync()
             await interaction.response.send_message(
                 "Panel deletion queued." if changed else "That panel is currently busy.",
                 ephemeral=True,
