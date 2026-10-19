@@ -161,6 +161,35 @@ def category_configs(categories: list[TicketPanelCategory]) -> list[TicketCatego
     ]
 
 
+def panel_sync_failure_message(record: TicketPanelRecord) -> str | None:
+    """Return actionable admin-facing guidance for a failed panel sync."""
+    panel = record.panel
+    if panel.status != "failed":
+        return None
+    code = (panel.error_code or "unknown").strip()
+    channel = f"<#{panel.panel_channel_id}>"
+    if code in {"50001", "50013", "Forbidden", "missing_permissions"}:
+        return (
+            f"Panel publication failed: Discord denied access to {channel}. "
+            "Allow the bot View Channel, Send Messages, Embed Links, and Read Message History "
+            "in that channel and its parent category, then click Publish again."
+        )
+    if code == "not_found":
+        return (
+            f"Panel publication failed: the configured channel {channel} or its message "
+            "no longer exists. Select an existing text channel, save, and publish again."
+        )
+    if code == "ticket_panel_channel_unavailable":
+        return (
+            f"Panel publication failed: {channel} is unavailable or is not a text channel. "
+            "Choose an accessible text channel and publish again."
+        )
+    return (
+        f"Panel publication failed (error {code}) for {channel}. "
+        "Check the bot permissions and try Publish again."
+    )
+
+
 def parse_role_ids(raw: str) -> list[int]:
     values: list[int] = []
     for value in raw.replace("<@&", "").replace(">", "").split(","):
@@ -410,10 +439,12 @@ class PanelEditorView(SafeView):
         return embed
 
     def editor_content(self) -> str:
-        return (
+        content = (
             f"Panel editor — {self.record.panel.status}. "
             "Every saved change refreshes this editor and any open preview."
         )
+        failure = panel_sync_failure_message(self.record)
+        return f"{content}\n\n⚠️ {failure}" if failure else content
 
     async def current_record(self) -> TicketPanelRecord | None:
         return await self.cog.repository.get_panel(
@@ -588,12 +619,20 @@ class PanelEditorView(SafeView):
                     if not refreshed:
                         refreshed = await self.send_fresh_editor(interaction, self.record)
                 await interaction.followup.send(
-                    "Panel synchronization queued." if changed else "The panel is currently busy or no longer exists.",
+                    (
+                        "Panel synchronization queued. Reopen the editor to see details if Discord rejects it."
+                        if changed
+                        else "The panel is currently synchronizing or no longer exists. Wait a moment and try again."
+                    ),
                     ephemeral=True,
                 )
             else:
                 await interaction.response.send_message(
-                    "Panel synchronization queued." if changed else "The panel is currently busy or no longer exists.",
+                    (
+                        "Panel synchronization queued. Reopen the editor to see details if Discord rejects it."
+                        if changed
+                        else "The panel is currently synchronizing or no longer exists. Wait a moment and try again."
+                    ),
                     ephemeral=True,
                 )
             return
@@ -1944,9 +1983,13 @@ class PanelManagerView(SafeView):
             inline=False,
         )
         if selected is not None:
+            failure = panel_sync_failure_message(selected)
+            selected_value = f"**{selected.panel.title}** ({selected.panel.status})"
+            if failure:
+                selected_value += f"\n\n⚠️ {failure}"
             embed.add_field(
                 name="Selected",
-                value=f"**{selected.panel.title}** ({selected.panel.status})",
+                value=selected_value[:1024],
                 inline=False,
             )
         return embed
@@ -1989,7 +2032,11 @@ class PanelManagerView(SafeView):
                 if ticket_cog is not None:
                     ticket_cog.request_panel_sync()
             await interaction.response.send_message(
-                "Panel synchronization queued." if changed else "That panel is currently busy.",
+                (
+                    "Panel synchronization queued. Reopen the panel editor if it reports an error."
+                    if changed
+                    else "That panel is currently synchronizing. Wait a moment and try again."
+                ),
                 ephemeral=True,
             )
         elif action == "delete":
