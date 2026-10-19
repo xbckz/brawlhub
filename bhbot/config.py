@@ -26,7 +26,7 @@ class Settings(BaseSettings):
     discord_members_intent_enabled: bool = False
     turso_database_url: str | None = None
     turso_auth_token: SecretStr | None = None
-    ticket_admin_user_ids: str = "606751416261935123"
+    ticket_admin_user_ids: str = "606751416261935123,812827883088642048"
     ticket_admin_role_ids: str = ""
 
     @field_validator("discord_application_id", "discord_development_guild_id", mode="before")
